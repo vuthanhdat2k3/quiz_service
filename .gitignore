@@ -192,11 +192,15 @@ data/
 # FAISS indexes (can be large)
 *.index
 
-# Model files (can be large)
-models/
+# Model files (can be large) - but keep Python source code
 *.bin
 *.pt
 *.onnx
+*.h5
+*.safetensors
+*.msgpack
+/models/
+sentence-transformers/
 
 # Backup files
 *.bak
