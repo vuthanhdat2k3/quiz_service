@@ -63,73 +63,71 @@ class QuizGenerationService:
         question_types: List[int],
     ) -> List[QuizQuestion]:
         
-        logger.info("Generating quiz from prompt")
+        logger.info(f"Generating {num_questions} quiz questions from prompt (batch mode)")
 
-        # Use LLM adapter to generate questions from prompt
         questions = []
-        questions_per_batch = max(1, num_questions // 2)
-        
-        # Determine question type distribution
-        if 2 in question_types:  # Mix mode
-            actual_types = [0, 1]  # Single and Multiple choice
-        else:
-            actual_types = question_types
         
         try:
-            for idx in range(num_questions):
-                if len(questions) >= num_questions:
-                    break
+            # Generate all questions in a single API call
+            options_cfg = {
+                "difficulty": difficulty,
+                "language": language,
+                "question_types": question_types,
+            }
+            
+            batch_result = await self.llm_adapter.generate_batch_mcq(
+                prompt, num_questions, options=options_cfg
+            )
+            
+            if batch_result and batch_result.questions:
+                from app.models.quiz import QuestionTypeEnum
                 
-                # Alternate question types
-                q_type = actual_types[idx % len(actual_types)]
+                # Determine question type distribution
+                if 2 in question_types:  # Mix mode
+                    actual_types = [0, 1]  # Single and Multiple choice
+                else:
+                    actual_types = question_types
                 
-                # Generate MCQ from prompt
-                options_cfg = {
-                    "difficulty": difficulty,
-                    "language": language,
-                    "num_correct": 1 if q_type == 0 else 2,
-                }
-                result = await self.llm_adapter.generate_mcq(
-                    prompt, options=options_cfg
-                )
-
-                if result and result.question and result.choices:
+                for idx, result in enumerate(batch_result.questions[:num_questions]):
+                    if not result.question or not result.choices:
+                        continue
+                    
+                    # Alternate question types based on answer format
+                    if isinstance(result.answer, list) and len(result.answer) > 1:
+                        q_type = 1  # Multiple choice
+                    else:
+                        q_type = 0  # Single choice
+                    
                     # Map answer letter(s) to index
                     answer_map = {"A": 0, "B": 1, "C": 2, "D": 3}
                     
-                    # Handle both single answer (string) and multiple answers (list/array)
                     if isinstance(result.answer, list):
-                        # Multiple correct answers: ["A", "B"]
                         correct_indices = [answer_map.get(a.strip().upper(), -1) for a in result.answer]
-                        correct_indices = [i for i in correct_indices if i >= 0]  # Filter invalid
+                        correct_indices = [i for i in correct_indices if i >= 0]
                     else:
-                        # Single correct answer: "A"
                         correct_indices = [answer_map.get(str(result.answer).strip().upper(), 0)]
 
-                    # Build options list
-                    from app.models.quiz import QuestionTypeEnum
+                    # Build options list - ID always defaults to 0
                     options = []
                     for opt_idx, opt_text in enumerate(result.choices):
                         options.append(
                             QuizOption(
-                                id=opt_idx,
+                                id=0,
                                 optionText=opt_text,
                                 isCorrect=(opt_idx in correct_indices),
                             )
                         )
 
                     question = QuizQuestion(
-                        id=len(questions),
+                        id=0,
                         questionText=result.question,
                         questionType=QuestionTypeEnum(q_type),
                         point=1.0,
                         options=options,
                     )
                     questions.append(question)
-
-                    logger.info(
-                        f"Generated question {len(questions)}/{num_questions} (type={q_type})"
-                    )
+                
+                logger.info(f"Successfully generated {len(questions)}/{num_questions} questions in single API call")
                     
         except Exception as e:
             logger.error(f"Error generating questions from prompt: {e}")
@@ -434,6 +432,7 @@ class QuizGenerationService:
         
         questions: List[QuizQuestion] = []
         question_chunk_ids: List[str] = []
+        existing_question_texts: List[str] = []  # Track generated questions to avoid duplicates
         questions_per_chunk = max(1, num_questions // len(candidate_chunks))
         
         # Determine question type distribution
@@ -457,6 +456,8 @@ class QuizGenerationService:
                         "difficulty": difficulty,
                         "language": language,
                         "num_correct": 1 if q_type == 0 else 2,
+                        "existing_questions": existing_question_texts,
+                        "question_index": idx,
                     }
                     result = await self.llm_adapter.generate_mcq(
                         chunk["text"], options=options_cfg
@@ -475,19 +476,19 @@ class QuizGenerationService:
                             # Single correct answer: "A"
                             correct_indices = [answer_map.get(str(result.answer).strip().upper(), 0)]
 
-                        # Build options list
+                        # Build options list - ID always defaults to 0
                         options = []
                         for opt_idx, opt_text in enumerate(result.choices):
                             options.append(
                                 QuizOption(
-                                    id=opt_idx,
+                                    id=0,  # Always default to 0
                                     optionText=opt_text,
                                     isCorrect=(opt_idx in correct_indices),
                                 )
                             )
 
                         question = QuizQuestion(
-                            id=len(questions),
+                            id=0,  # Always default to 0
                             questionText=result.question,
                             questionType=QuestionTypeEnum(q_type),
                             point=1.0,
@@ -495,6 +496,9 @@ class QuizGenerationService:
                         )
                         questions.append(question)
                         question_chunk_ids.append(chunk.get("chunk_id", ""))
+                        
+                        # Track generated question to avoid duplicates
+                        existing_question_texts.append(result.question)
 
                         logger.info(
                             f"Generated question {len(questions)}/{num_questions} (type={q_type})"
@@ -561,7 +565,7 @@ class QuizGenerationService:
                         
                         for idx, distractor in enumerate(result.distractors[:3]):
                             new_options.append(QuizOption(
-                                id=len(new_options),
+                                id=0,  # Always default to 0
                                 optionText=distractor,
                                 isCorrect=False
                             ))
@@ -569,7 +573,7 @@ class QuizGenerationService:
                         # Create enhanced question
                         from app.models.quiz import QuizQuestion as QQ
                         enhanced_q = QQ(
-                            id=question.id,
+                            id=0,  # Always default to 0
                             questionText=question.questionText,
                             questionType=question.questionType,
                             point=question.point,

@@ -11,6 +11,7 @@ except ImportError:
 from app.llm.base_adapter import (
     LLMAdapter,
     MCQResult,
+    BatchMCQResult,
     DistractorResult,
     ShortAnswerResult,
     TrueFalseResult,
@@ -57,7 +58,7 @@ class OpenAIAdapter(LLMAdapter):
                     raise
 
     async def generate_mcq(self, passage: str, options: Optional[Dict[str, Any]] = None) -> MCQResult:
-        prompt = self._build_mcq_prompt(passage)
+        prompt = self._build_mcq_prompt(passage, options)
         response_text = await self._call_with_retry(prompt)
 
         try:
@@ -71,6 +72,49 @@ class OpenAIAdapter(LLMAdapter):
             )
         except (json.JSONDecodeError, KeyError) as e:
             logger.error(f"Failed to parse MCQ response: {e}")
+            raise
+
+    async def generate_batch_mcq(
+        self, passage: str, num_questions: int, options: Optional[Dict[str, Any]] = None
+    ) -> BatchMCQResult:
+        """Generate multiple MCQ questions in a single API call"""
+        
+        prompt = self._build_batch_mcq_prompt(passage, num_questions, options)
+        response_text = await self._call_with_retry(prompt)
+
+        try:
+            data = json.loads(response_text)
+            
+            if isinstance(data, dict) and "questions" in data:
+                questions_data = data["questions"]
+            elif isinstance(data, list):
+                questions_data = data
+            else:
+                raise ValueError(f"Expected array or object with 'questions' key, got {type(data)}")
+            
+            questions = []
+            for q_data in questions_data:
+                choices = q_data.get("choices", [])
+                cleaned_choices = []
+                for choice in choices:
+                    if len(choice) > 2 and choice[1] in ")]:.-" and choice[0].upper() in "ABCD":
+                        cleaned_choices.append(choice[2:].strip())
+                    else:
+                        cleaned_choices.append(choice)
+                
+                questions.append(MCQResult(
+                    question=q_data["question"],
+                    choices=cleaned_choices if cleaned_choices else choices,
+                    answer=q_data["answer"],
+                    explanation=q_data.get("explanation", ""),
+                    difficulty=q_data.get("difficulty", "medium"),
+                ))
+            
+            logger.info(f"Generated {len(questions)} questions in single API call")
+            return BatchMCQResult(questions=questions)
+            
+        except (json.JSONDecodeError, KeyError, ValueError) as e:
+            logger.error(f"Failed to parse batch MCQ response: {e}")
             raise
 
     async def refine_distractors(

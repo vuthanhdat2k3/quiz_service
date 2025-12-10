@@ -6,6 +6,7 @@ from loguru import logger
 from app.llm.base_adapter import (
     LLMAdapter,
     MCQResult,
+    BatchMCQResult,
     DistractorResult,
     ShortAnswerResult,
     TrueFalseResult,
@@ -42,6 +43,31 @@ class MockLLMAdapter(LLMAdapter):
             explanation=explanation,
             difficulty=difficulty,
         )
+
+    async def generate_batch_mcq(
+        self, passage: str, num_questions: int, options: Optional[Dict[str, Any]] = None
+    ) -> BatchMCQResult:
+        """Generate multiple mock MCQ questions"""
+        questions = []
+        
+        for i in range(num_questions):
+            passage_hash = hashlib.md5(f"{passage}_{i}".encode()).hexdigest()[:8]
+            
+            questions.append(MCQResult(
+                question=f"Question {i+1}: What concept is discussed? (mock-{passage_hash})",
+                choices=[
+                    f"Option A for question {i+1}",
+                    f"Option B for question {i+1}",
+                    f"Option C for question {i+1}",
+                    f"Option D for question {i+1}",
+                ],
+                answer="A" if i % 2 == 0 else ["A", "B"],
+                explanation=f"Mock explanation for question {i+1}",
+                difficulty="medium",
+            ))
+        
+        logger.debug(f"Mock generated {num_questions} batch MCQ questions")
+        return BatchMCQResult(questions=questions)
 
     async def refine_distractors(
         self, passage: str, correct_answer: str, candidates: List[str]
