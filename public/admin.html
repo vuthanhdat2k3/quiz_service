@@ -1,0 +1,344 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Quiz Service - Database Admin</title>
+    <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">
+    <link href="https://cdn.jsdelivr.net/npm/@heroicons/vue@1.0.6/outline/esm/index.min.js" rel="stylesheet">
+    <style>
+        .sidebar { width: 250px; }
+        .main-content { margin-left: 250px; }
+        .card { @apply bg-white rounded-lg shadow-md p-6; }
+        .btn { @apply px-4 py-2 rounded-md font-medium transition-colors; }
+        .btn-primary { @apply bg-blue-600 text-white hover:bg-blue-700; }
+        .btn-danger { @apply bg-red-600 text-white hover:bg-red-700; }
+        .btn-secondary { @apply bg-gray-200 text-gray-800 hover:bg-gray-300; }
+        .loading { @apply animate-pulse bg-gray-200; }
+        .table-row:hover { @apply bg-gray-50; }
+        .modal { @apply fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50; }
+        .modal-content { @apply bg-white rounded-lg shadow-xl max-w-2xl w-full max-h-screen overflow-y-auto; }
+        .toast { @apply fixed bottom-4 right-4 px-6 py-3 rounded-lg shadow-lg z-50 transition-all transform; }
+        .toast-success { @apply bg-green-500 text-white; }
+        .toast-error { @apply bg-red-500 text-white; }
+        .stat-card { @apply bg-gradient-to-br p-6 rounded-xl text-white; }
+        pre { @apply bg-gray-100 p-4 rounded-lg overflow-x-auto text-sm; }
+        code { @apply font-mono; }
+    </style>
+</head>
+<body class="bg-gray-100">
+    <div id="app">
+        <!-- Sidebar -->
+        <aside class="sidebar fixed left-0 top-0 h-full bg-gray-900 text-white">
+            <div class="p-4 border-b border-gray-700">
+                <h1 class="text-xl font-bold">🎓 Quiz Admin</h1>
+                <p class="text-gray-400 text-sm mt-1">Database Management</p>
+            </div>
+            <nav class="p-4">
+                <ul class="space-y-2">
+                    <li>
+                        <a href="#" onclick="showSection('dashboard')" class="nav-link flex items-center p-2 rounded hover:bg-gray-800" data-section="dashboard">
+                            <span class="mr-3">📊</span> Dashboard
+                        </a>
+                    </li>
+                    <li>
+                        <a href="#" onclick="showSection('documents')" class="nav-link flex items-center p-2 rounded hover:bg-gray-800" data-section="documents">
+                            <span class="mr-3">📄</span> Documents
+                        </a>
+                    </li>
+                    <li>
+                        <a href="#" onclick="showSection('faiss')" class="nav-link flex items-center p-2 rounded hover:bg-gray-800" data-section="faiss">
+                            <span class="mr-3">🔍</span> FAISS Index
+                        </a>
+                    </li>
+                    <li>
+                        <a href="#" onclick="showSection('query')" class="nav-link flex items-center p-2 rounded hover:bg-gray-800" data-section="query">
+                            <span class="mr-3">💻</span> Neo4j Query
+                        </a>
+                    </li>
+                    <li>
+                        <a href="#" onclick="showSection('settings')" class="nav-link flex items-center p-2 rounded hover:bg-gray-800" data-section="settings">
+                            <span class="mr-3">⚙️</span> Settings
+                        </a>
+                    </li>
+                </ul>
+            </nav>
+            <div class="absolute bottom-0 left-0 right-0 p-4 border-t border-gray-700">
+                <a href="/docs" target="_blank" class="text-gray-400 hover:text-white text-sm flex items-center">
+                    <span class="mr-2">📚</span> API Docs
+                </a>
+            </div>
+        </aside>
+
+        <!-- Main Content -->
+        <main class="main-content min-h-screen p-6">
+            <!-- Dashboard Section -->
+            <section id="section-dashboard" class="section">
+                <h2 class="text-2xl font-bold mb-6">Dashboard</h2>
+                
+                <!-- Stats Grid -->
+                <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6 mb-8">
+                    <div class="stat-card from-blue-500 to-blue-600">
+                        <p class="text-blue-100 text-sm">Documents</p>
+                        <p class="text-3xl font-bold mt-2" id="stat-documents">-</p>
+                    </div>
+                    <div class="stat-card from-green-500 to-green-600">
+                        <p class="text-green-100 text-sm">Chunks</p>
+                        <p class="text-3xl font-bold mt-2" id="stat-chunks">-</p>
+                    </div>
+                    <div class="stat-card from-purple-500 to-purple-600">
+                        <p class="text-purple-100 text-sm">Questions</p>
+                        <p class="text-3xl font-bold mt-2" id="stat-questions">-</p>
+                    </div>
+                    <div class="stat-card from-orange-500 to-orange-600">
+                        <p class="text-orange-100 text-sm">FAISS Vectors</p>
+                        <p class="text-3xl font-bold mt-2" id="stat-vectors">-</p>
+                    </div>
+                </div>
+
+                <!-- Quick Actions -->
+                <div class="bg-white rounded-lg shadow-md p-6 mb-8">
+                    <h3 class="text-lg font-semibold mb-4">Quick Actions</h3>
+                    <div class="flex flex-wrap gap-4">
+                        <button onclick="refreshStats()" class="btn btn-primary">
+                            🔄 Refresh Stats
+                        </button>
+                        <button onclick="rebuildFaissIndex()" class="btn btn-secondary">
+                            🔧 Rebuild FAISS Index
+                        </button>
+                        <button onclick="showClearAllModal()" class="btn btn-danger">
+                            ⚠️ Clear All Data
+                        </button>
+                    </div>
+                </div>
+
+                <!-- Detailed Stats -->
+                <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                    <div class="bg-white rounded-lg shadow-md p-6">
+                        <h3 class="text-lg font-semibold mb-4">Neo4j Statistics</h3>
+                        <div id="neo4j-stats" class="space-y-3">
+                            <p class="text-gray-500">Loading...</p>
+                        </div>
+                    </div>
+                    <div class="bg-white rounded-lg shadow-md p-6">
+                        <h3 class="text-lg font-semibold mb-4">FAISS Statistics</h3>
+                        <div id="faiss-stats" class="space-y-3">
+                            <p class="text-gray-500">Loading...</p>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Documents Section -->
+            <section id="section-documents" class="section hidden">
+                <div class="flex justify-between items-center mb-6">
+                    <h2 class="text-2xl font-bold">Documents</h2>
+                    <div class="flex gap-4">
+                        <select id="language-filter" onchange="loadDocuments()" class="border rounded-md px-3 py-2">
+                            <option value="">All Languages</option>
+                            <option value="vi">Vietnamese</option>
+                            <option value="en">English</option>
+                        </select>
+                        <button onclick="loadDocuments()" class="btn btn-primary">🔄 Refresh</button>
+                    </div>
+                </div>
+
+                <div class="bg-white rounded-lg shadow-md overflow-hidden">
+                    <table class="w-full">
+                        <thead class="bg-gray-50">
+                            <tr>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Title</th>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Language</th>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Sections</th>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Chunks</th>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Questions</th>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Created</th>
+                                <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody id="documents-table" class="divide-y divide-gray-200">
+                            <tr><td colspan="7" class="px-6 py-4 text-center text-gray-500">Loading...</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+
+                <div id="documents-pagination" class="mt-4 flex justify-between items-center">
+                    <p class="text-gray-600 text-sm" id="documents-info"></p>
+                    <div class="flex gap-2">
+                        <button onclick="prevDocumentsPage()" class="btn btn-secondary" id="btn-prev-docs">Previous</button>
+                        <button onclick="nextDocumentsPage()" class="btn btn-secondary" id="btn-next-docs">Next</button>
+                    </div>
+                </div>
+            </section>
+
+            <!-- FAISS Section -->
+            <section id="section-faiss" class="section hidden">
+                <h2 class="text-2xl font-bold mb-6">FAISS Vector Index</h2>
+
+                <!-- FAISS Stats -->
+                <div class="bg-white rounded-lg shadow-md p-6 mb-6">
+                    <h3 class="text-lg font-semibold mb-4">Index Information</h3>
+                    <div id="faiss-detailed-stats" class="grid grid-cols-2 md:grid-cols-4 gap-4">
+                        <p class="text-gray-500">Loading...</p>
+                    </div>
+                </div>
+
+                <!-- Search -->
+                <div class="bg-white rounded-lg shadow-md p-6 mb-6">
+                    <h3 class="text-lg font-semibold mb-4">Semantic Search</h3>
+                    <div class="flex gap-4 mb-4">
+                        <input type="text" id="search-query" placeholder="Enter search query..." 
+                               class="flex-1 border rounded-md px-4 py-2">
+                        <input type="text" id="search-doc-id" placeholder="Document ID (optional)" 
+                               class="w-64 border rounded-md px-4 py-2">
+                        <button onclick="searchChunks()" class="btn btn-primary">🔍 Search</button>
+                    </div>
+                    <div id="search-results" class="space-y-4">
+                        <!-- Search results will appear here -->
+                    </div>
+                </div>
+
+                <!-- Actions -->
+                <div class="bg-white rounded-lg shadow-md p-6">
+                    <h3 class="text-lg font-semibold mb-4">Index Actions</h3>
+                    <div class="flex gap-4">
+                        <button onclick="rebuildFaissIndex()" class="btn btn-primary">
+                            🔧 Rebuild Index
+                        </button>
+                        <button onclick="clearFaissIndex()" class="btn btn-danger">
+                            🗑️ Clear Index
+                        </button>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Neo4j Query Section -->
+            <section id="section-query" class="section hidden">
+                <h2 class="text-2xl font-bold mb-6">Neo4j Query Console</h2>
+
+                <div class="bg-white rounded-lg shadow-md p-6 mb-6">
+                    <div class="mb-4">
+                        <label class="block text-sm font-medium text-gray-700 mb-2">Cypher Query</label>
+                        <textarea id="cypher-query" rows="4" 
+                                  class="w-full border rounded-md px-4 py-2 font-mono text-sm"
+                                  placeholder="MATCH (n) RETURN n LIMIT 10">MATCH (d:Document) RETURN d.id, d.title, d.language LIMIT 10</textarea>
+                    </div>
+                    <div class="flex gap-4 items-center">
+                        <label class="flex items-center">
+                            <input type="checkbox" id="read-only" checked class="mr-2">
+                            <span class="text-sm">Read Only</span>
+                        </label>
+                        <button onclick="executeCypherQuery()" class="btn btn-primary">
+                            ▶️ Execute
+                        </button>
+                    </div>
+                </div>
+
+                <div class="bg-white rounded-lg shadow-md p-6">
+                    <h3 class="text-lg font-semibold mb-4">Results</h3>
+                    <div id="query-results" class="overflow-x-auto">
+                        <p class="text-gray-500">Execute a query to see results</p>
+                    </div>
+                </div>
+
+                <!-- Query Templates -->
+                <div class="bg-white rounded-lg shadow-md p-6 mt-6">
+                    <h3 class="text-lg font-semibold mb-4">Query Templates</h3>
+                    <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                        <button onclick="setQuery('MATCH (d:Document) RETURN d.id, d.title, d.language ORDER BY d.created_at DESC LIMIT 20')" 
+                                class="text-left p-3 border rounded hover:bg-gray-50">
+                            <p class="font-medium">List Documents</p>
+                            <p class="text-sm text-gray-500">Show all documents</p>
+                        </button>
+                        <button onclick="setQuery('MATCH (d:Document)-[:HAS_SECTION]->(s:Section)-[:HAS_CHUNK]->(c:Chunk) RETURN d.title, count(c) as chunks GROUP BY d.title')" 
+                                class="text-left p-3 border rounded hover:bg-gray-50">
+                            <p class="font-medium">Chunks per Document</p>
+                            <p class="text-sm text-gray-500">Count chunks by document</p>
+                        </button>
+                        <button onclick="setQuery('MATCH (q:Question)-[:BASED_ON]->(c:Chunk) RETURN q.question, q.type, q.difficulty LIMIT 20')" 
+                                class="text-left p-3 border rounded hover:bg-gray-50">
+                            <p class="font-medium">List Questions</p>
+                            <p class="text-sm text-gray-500">Show generated questions</p>
+                        </button>
+                        <button onclick="setQuery('MATCH (n) RETURN labels(n) as type, count(*) as count')" 
+                                class="text-left p-3 border rounded hover:bg-gray-50">
+                            <p class="font-medium">Node Counts</p>
+                            <p class="text-sm text-gray-500">Count nodes by type</p>
+                        </button>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Settings Section -->
+            <section id="section-settings" class="section hidden">
+                <h2 class="text-2xl font-bold mb-6">Settings & Danger Zone</h2>
+
+                <div class="bg-red-50 border border-red-200 rounded-lg p-6">
+                    <h3 class="text-lg font-semibold text-red-800 mb-4">⚠️ Danger Zone</h3>
+                    <p class="text-red-700 mb-4">These actions are irreversible. Please be careful.</p>
+                    
+                    <div class="space-y-4">
+                        <div class="flex items-center justify-between p-4 bg-white rounded border">
+                            <div>
+                                <p class="font-medium">Clear FAISS Index</p>
+                                <p class="text-sm text-gray-500">Remove all vector embeddings</p>
+                            </div>
+                            <button onclick="clearFaissIndex()" class="btn btn-danger">Clear FAISS</button>
+                        </div>
+                        
+                        <div class="flex items-center justify-between p-4 bg-white rounded border">
+                            <div>
+                                <p class="font-medium">Clear All Data</p>
+                                <p class="text-sm text-gray-500">Remove all documents, chunks, questions from Neo4j and FAISS</p>
+                            </div>
+                            <button onclick="showClearAllModal()" class="btn btn-danger">Clear All</button>
+                        </div>
+                    </div>
+                </div>
+            </section>
+        </main>
+
+        <!-- Document Detail Modal -->
+        <div id="document-modal" class="modal hidden">
+            <div class="modal-content m-4">
+                <div class="p-6 border-b">
+                    <div class="flex justify-between items-center">
+                        <h3 class="text-xl font-bold" id="modal-doc-title">Document Details</h3>
+                        <button onclick="closeDocumentModal()" class="text-gray-500 hover:text-gray-700 text-2xl">&times;</button>
+                    </div>
+                </div>
+                <div class="p-6" id="modal-doc-content">
+                    Loading...
+                </div>
+            </div>
+        </div>
+
+        <!-- Clear All Confirmation Modal -->
+        <div id="clear-all-modal" class="modal hidden">
+            <div class="modal-content m-4 max-w-md">
+                <div class="p-6">
+                    <h3 class="text-xl font-bold text-red-600 mb-4">⚠️ Clear All Data</h3>
+                    <p class="mb-4">This action will permanently delete:</p>
+                    <ul class="list-disc list-inside mb-4 text-gray-700">
+                        <li>All documents</li>
+                        <li>All sections and chunks</li>
+                        <li>All generated questions</li>
+                        <li>All FAISS vector embeddings</li>
+                    </ul>
+                    <p class="mb-4">Type <strong>CONFIRM</strong> to proceed:</p>
+                    <input type="text" id="confirm-clear-input" class="w-full border rounded-md px-4 py-2 mb-4" placeholder="Type CONFIRM">
+                    <div class="flex gap-4">
+                        <button onclick="closeClearAllModal()" class="btn btn-secondary flex-1">Cancel</button>
+                        <button onclick="confirmClearAll()" class="btn btn-danger flex-1">Clear All</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Toast Container -->
+        <div id="toast-container"></div>
+    </div>
+
+    <script src="admin.js"></script>
+</body>
+</html>

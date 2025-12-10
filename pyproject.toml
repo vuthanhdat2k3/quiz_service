@@ -1,0 +1,42 @@
+[tool.poetry]
+name = "quiz-service"
+version = "1.0.0"
+description = "AI-powered quiz generation service with document parsing"
+authors = ["Your Team"]
+
+[tool.poetry.dependencies]
+python = "^3.11"
+fastapi = "^0.115.0"
+uvicorn = {extras = ["standard"], version = "^0.31.0"}
+pydantic = "^2.9.2"
+pydantic-settings = "^2.6.0"
+python-multipart = "^0.0.12"
+llama-parse = "^0.5.11"
+google-generativeai = "^0.8.3"
+python-docx = "^1.1.2"
+python-pptx = "^1.0.2"
+PyPDF2 = "^3.0.1"
+python-dotenv = "^1.0.1"
+aiofiles = "^24.1.0"
+loguru = "^0.7.2"
+langchain = "^0.3.7"
+langchain-text-splitters = "^0.3.2"
+
+[tool.poetry.dev-dependencies]
+pytest = "^8.0.0"
+pytest-asyncio = "^0.23.0"
+black = "^24.0.0"
+isort = "^5.13.0"
+flake8 = "^7.0.0"
+
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.black]
+line-length = 100
+target-version = ['py311']
+
+[tool.isort]
+profile = "black"
+line_length = 100
