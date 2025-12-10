@@ -37,7 +37,9 @@ chardet==5.2.0
 
 # ML / Embeddings / NLP
 # Note: torch CPU-only is installed in Dockerfile before this file
-sentence-transformers>=2.2.0
+# Pin transformers to version compatible with torch 2.1.0
+transformers>=4.36.0,<4.46.0
+sentence-transformers>=2.2.0,<3.0.0
 faiss-cpu>=1.7.4
 scikit-learn>=1.3.0
 

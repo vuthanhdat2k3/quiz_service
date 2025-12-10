@@ -15,7 +15,7 @@ from app.parsers import ParserFactory
 from app.chunkers.markdown_chunker import MarkdownChunkerV2
 from app.llm import get_llm_adapter
 from app.core.config import get_settings
-from app.graph import DocumentGraphBuilder, DocumentNode, SectionNode, ChunkNode
+from app.graph import DocumentGraphBuilder
 from app.services.chunk_selector import ChunkSelector, ChunkSelectionConfig
 
 
@@ -271,18 +271,17 @@ class QuizGenerationService:
                 "num_candidates": len(candidate_chunks)
             })
 
-            # Step 6: Generate questions with LLM
-            logger.info("🤖 Step 6: Generating questions with LLM...")
-            questions, question_chunk_ids = await self._generate_questions_from_candidates(
+            # Step 6: Generate questions with LLM (single batch call)
+            logger.info("🤖 Step 6: Generating questions with LLM (batch mode)...")
+            questions, question_chunk_ids = await self._generate_questions_batch(
                 candidate_chunks=candidate_chunks,
                 num_questions=num_questions,
                 difficulty=difficulty,
                 language=language,
                 question_types=question_types,
-                additional_prompt=additional_prompt
             )
             
-            logger.info(f"✓ Generated {len(questions)} questions")
+            logger.info(f"✓ Generated {len(questions)} questions in single API call")
             metadata["steps"].append({
                 "step": 6,
                 "name": "question_generation",
@@ -290,22 +289,8 @@ class QuizGenerationService:
                 "num_questions": len(questions)
             })
 
-            # Step 7: Generate distractors using graph neighbors
-            logger.info("🔀 Step 7: Generating distractors from graph...")
-            questions = await self._enhance_distractors_from_graph(
-                questions=questions,
-                question_chunk_ids=question_chunk_ids
-            )
-            
-            logger.info(f"✓ Enhanced distractors for {len(questions)} questions")
-            metadata["steps"].append({
-                "step": 7,
-                "name": "distractor_generation",
-                "status": "success"
-            })
-
-            # Step 8: Store questions in Neo4j
-            logger.info("💾 Step 8: Storing questions in Neo4j...")
+            # Step 7: Store questions in Neo4j
+            logger.info("💾 Step 7: Storing questions in Neo4j...")
             for idx, question in enumerate(questions):
                 question_id = f"{document_id}_q_{idx}"
                 src_chunk_id = question_chunk_ids[idx] if idx < len(question_chunk_ids) else chunk_ids[0]
@@ -331,7 +316,7 @@ class QuizGenerationService:
             
             logger.info(f"✓ Stored {len(questions)} questions in Neo4j")
             metadata["steps"].append({
-                "step": 8,
+                "step": 7,
                 "name": "question_storage",
                 "status": "success",
                 "questions_stored": len(questions)
@@ -418,181 +403,91 @@ class QuizGenerationService:
         
         return candidates
 
-    async def _generate_questions_from_candidates(
+    async def _generate_questions_batch(
         self,
         candidate_chunks: List[Dict[str, Any]],
         num_questions: int,
         difficulty: str,
         language: str,
         question_types: List[int],
-        additional_prompt: Optional[str] = None
     ) -> tuple[List[QuizQuestion], List[str]]:
+        """Generate all questions in a single LLM API call using batch mode."""
         
         from app.models.quiz import QuizOption, QuestionTypeEnum
         
         questions: List[QuizQuestion] = []
         question_chunk_ids: List[str] = []
-        existing_question_texts: List[str] = []  # Track generated questions to avoid duplicates
-        questions_per_chunk = max(1, num_questions // len(candidate_chunks))
         
-        # Determine question type distribution
-        if 2 in question_types:  # Mix mode
-            actual_types = [0, 1]  # Single and Multiple choice
-        else:
-            actual_types = question_types
+        # Combine candidate chunks into a single content block
+        combined_content = "\n\n---\n\n".join([
+            f"[Section {idx+1}]\n{chunk['text']}" 
+            for idx, chunk in enumerate(candidate_chunks[:num_questions])
+        ])
         
-        for idx, chunk in enumerate(candidate_chunks[:num_questions]):
-            if len(questions) >= num_questions:
-                break
+        # Build options for batch generation
+        options_cfg = {
+            "difficulty": difficulty,
+            "language": language,
+            "question_types": question_types,
+        }
+        
+        try:
+            # Single API call to generate all questions
+            batch_result = await self.llm_adapter.generate_batch_mcq(
+                combined_content, num_questions, options=options_cfg
+            )
             
-            # Alternate question types
-            q_type = actual_types[idx % len(actual_types)]
-            
-            try:
-                # Generate MCQ for this chunk
-                if q_type in [0, 1]:  # Single or Multiple choice
-                    # Call adapter with passage and optional params
-                    options_cfg = {
-                        "difficulty": difficulty,
-                        "language": language,
-                        "num_correct": 1 if q_type == 0 else 2,
-                        "existing_questions": existing_question_texts,
-                        "question_index": idx,
-                    }
-                    result = await self.llm_adapter.generate_mcq(
-                        chunk["text"], options=options_cfg
-                    )
+            if batch_result and batch_result.questions:
+                for idx, result in enumerate(batch_result.questions[:num_questions]):
+                    if not result.question or not result.choices:
+                        continue
+                    
+                    # Determine question type based on answer format
+                    if isinstance(result.answer, list) and len(result.answer) > 1:
+                        q_type = 1  # Multiple choice
+                    else:
+                        q_type = 0  # Single choice
+                    
+                    # Map answer letter(s) to index
+                    answer_map = {"A": 0, "B": 1, "C": 2, "D": 3}
+                    
+                    if isinstance(result.answer, list):
+                        correct_indices = [answer_map.get(a.strip().upper(), -1) for a in result.answer]
+                        correct_indices = [i for i in correct_indices if i >= 0]
+                    else:
+                        correct_indices = [answer_map.get(str(result.answer).strip().upper(), 0)]
 
-                    if result and result.question and result.choices:
-                        # Map answer letter(s) to index
-                        answer_map = {"A": 0, "B": 1, "C": 2, "D": 3}
-                        
-                        # Handle both single answer (string) and multiple answers (list/array)
-                        if isinstance(result.answer, list):
-                            # Multiple correct answers: ["A", "B"]
-                            correct_indices = [answer_map.get(a.strip().upper(), -1) for a in result.answer]
-                            correct_indices = [i for i in correct_indices if i >= 0]  # Filter invalid
-                        else:
-                            # Single correct answer: "A"
-                            correct_indices = [answer_map.get(str(result.answer).strip().upper(), 0)]
-
-                        # Build options list - ID always defaults to 0
-                        options = []
-                        for opt_idx, opt_text in enumerate(result.choices):
-                            options.append(
-                                QuizOption(
-                                    id=0,  # Always default to 0
-                                    optionText=opt_text,
-                                    isCorrect=(opt_idx in correct_indices),
-                                )
+                    # Build options list - ID always defaults to 0
+                    options = []
+                    for opt_idx, opt_text in enumerate(result.choices):
+                        options.append(
+                            QuizOption(
+                                id=0,
+                                optionText=opt_text,
+                                isCorrect=(opt_idx in correct_indices),
                             )
-
-                        question = QuizQuestion(
-                            id=0,  # Always default to 0
-                            questionText=result.question,
-                            questionType=QuestionTypeEnum(q_type),
-                            point=1.0,
-                            options=options,
                         )
-                        questions.append(question)
-                        question_chunk_ids.append(chunk.get("chunk_id", ""))
-                        
-                        # Track generated question to avoid duplicates
-                        existing_question_texts.append(result.question)
 
-                        logger.info(
-                            f"Generated question {len(questions)}/{num_questions} (type={q_type})"
-                        )
+                    question = QuizQuestion(
+                        id=0,
+                        questionText=result.question,
+                        questionType=QuestionTypeEnum(q_type),
+                        point=1.0,
+                        options=options,
+                    )
+                    questions.append(question)
+                    
+                    # Map to corresponding chunk ID
+                    chunk_idx = min(idx, len(candidate_chunks) - 1)
+                    question_chunk_ids.append(candidate_chunks[chunk_idx].get("chunk_id", ""))
                 
-            except Exception as e:
-                logger.error(f"Error generating question from chunk {idx}: {e}")
-                continue
+                logger.info(f"Generated {len(questions)} questions in single batch API call")
+                    
+        except Exception as e:
+            logger.error(f"Error in batch question generation: {e}")
+            raise
         
         return questions, question_chunk_ids
-
-    async def _enhance_distractors_from_graph(
-        self,
-        questions: List[QuizQuestion],
-        question_chunk_ids: List[str]
-    ) -> List[QuizQuestion]:
-        
-        enhanced_questions = []
-        
-        for idx, question in enumerate(questions):
-            try:
-                # Get neighbor chunks from Neo4j for the source chunk (limited to 5)
-                src_chunk_id = question_chunk_ids[idx] if idx < len(question_chunk_ids) else None
-                if not src_chunk_id:
-                    enhanced_questions.append(question)
-                    continue
-                neighbor_chunks = self.neo4j_db.get_neighbor_chunks(src_chunk_id, same_section=True, limit=5)
-                
-                if not neighbor_chunks or len(neighbor_chunks) < 2:
-                    # Not enough neighbors, keep original
-                    enhanced_questions.append(question)
-                    continue
-                
-                # Extract text from neighbors (exclude correct answer context)
-                neighbor_texts = [chunk.get("content", "") for chunk in neighbor_chunks]
-                neighbor_context = "\n".join(neighbor_texts[:3])  # Use top 3
-                
-                # Get current incorrect options
-                incorrect_options = [
-                    opt for opt in question.options if not opt.isCorrect
-                ]
-                
-                if len(incorrect_options) < 2:
-                    # Not enough to enhance
-                    enhanced_questions.append(question)
-                    continue
-                
-                # Use LLM to refine distractors using neighbor context
-                try:
-                    # Pick the first correct answer (adapter expects single string)
-                    correct_candidates = [opt.optionText for opt in question.options if opt.isCorrect]
-                    correct_answer = correct_candidates[0] if correct_candidates else ""
-                    current_distractors = [opt.optionText for opt in incorrect_options]
-
-                    result = await self.llm_adapter.refine_distractors(
-                        passage=neighbor_context,
-                        correct_answer=correct_answer,
-                        candidates=current_distractors,
-                    )
-
-                    if result and result.distractors and len(result.distractors) >= 2:
-                        # Replace incorrect options with refined distractors
-                        new_options = [opt for opt in question.options if opt.isCorrect]
-                        
-                        for idx, distractor in enumerate(result.distractors[:3]):
-                            new_options.append(QuizOption(
-                                id=0,  # Always default to 0
-                                optionText=distractor,
-                                isCorrect=False
-                            ))
-                        
-                        # Create enhanced question
-                        from app.models.quiz import QuizQuestion as QQ
-                        enhanced_q = QQ(
-                            id=0,  # Always default to 0
-                            questionText=question.questionText,
-                            questionType=question.questionType,
-                            point=question.point,
-                            options=new_options
-                        )
-                        enhanced_questions.append(enhanced_q)
-                        logger.info(f"Enhanced distractors for question {question.id}")
-                    else:
-                        enhanced_questions.append(question)
-                        
-                except Exception as e:
-                    logger.warning(f"Failed to refine distractors: {e}")
-                    enhanced_questions.append(question)
-                    
-            except Exception as e:
-                logger.error(f"Error enhancing question {question.id}: {e}")
-                enhanced_questions.append(question)
-        
-        return enhanced_questions
 
     def close(self):
         
