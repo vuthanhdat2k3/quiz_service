@@ -1,20 +1,48 @@
-FROM python:3.11-slim
+# ===========================================
+# Multi-stage build for smaller image size
+# Target: < 4GB for Railway free tier
+# ===========================================
 
-# Set working directory
+# Stage 1: Build dependencies
+FROM python:3.11-slim as builder
+
 WORKDIR /app
 
-# Install system dependencies
-RUN apt-get update && apt-get install -y \
+# Install build dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
-    curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements first for better caching
-COPY requirements.txt .
+# Copy requirements
+COPY requirements.prod.txt .
 
-# Install Python dependencies
-RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir -r requirements.txt
+# Install CPU-only PyTorch first (much smaller than default)
+RUN pip install --no-cache-dir \
+    torch==2.1.0 --index-url https://download.pytorch.org/whl/cpu
+
+# Install other dependencies
+RUN pip install --no-cache-dir -r requirements.prod.txt
+
+# Stage 2: Runtime image
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Set environment variables
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+ENV TRANSFORMERS_CACHE=/app/.cache
+ENV HF_HOME=/app/.cache
+
+# Install runtime dependencies only
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean
+
+# Copy installed packages from builder
+COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
+COPY --from=builder /usr/local/bin /usr/local/bin
 
 # Copy application code
 COPY ./app ./app
