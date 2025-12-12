@@ -26,7 +26,12 @@ RUN pip install --no-cache-dir -r requirements.prod.txt
 # Stage 2: Runtime image
 FROM python:3.11-slim
 
+
 WORKDIR /app
+
+# Create custom user
+RUN useradd -m -u 1000 appuser
+
 
 # Set environment variables
 ENV PYTHONDONTWRITEBYTECODE=1
@@ -64,8 +69,6 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:8000/health || exit 1
 
 # Run the application
-# Run the application
-RUN useradd -m -u 1000 appuser
 USER appuser
 
 CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
