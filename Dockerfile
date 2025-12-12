@@ -33,6 +33,9 @@ ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 ENV TRANSFORMERS_CACHE=/app/.cache
 ENV HF_HOME=/app/.cache
+ENV NLTK_DATA=/app/nltk_data
+
+# Install runtime dependencies only
 
 # Install runtime dependencies only
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -50,8 +53,8 @@ COPY ./app ./app
 # Copy public folder for UI
 COPY ./public ./public
 
-# Create logs and faiss_index directories with correct permissions
-RUN mkdir -p logs faiss_index && chown -R appuser:appuser /app
+# Create logs, faiss_index, and cache directories with correct permissions
+RUN mkdir -p logs faiss_index nltk_data .cache && chown -R appuser:appuser /app
 
 # Expose port
 EXPOSE 8000
