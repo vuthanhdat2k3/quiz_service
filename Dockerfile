@@ -50,8 +50,8 @@ COPY ./app ./app
 # Copy public folder for UI
 COPY ./public ./public
 
-# Create logs directory
-RUN mkdir -p logs && chown -R appuser:appuser /app
+# Create logs and faiss_index directories with correct permissions
+RUN mkdir -p logs faiss_index && chown -R appuser:appuser /app
 
 # Expose port
 EXPOSE 8000

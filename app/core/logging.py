@@ -1,5 +1,7 @@
 import sys
 from loguru import logger
+from pathlib import Path
+
 
 from app.core.config import get_settings
 
@@ -19,12 +21,18 @@ def setup_logging():
     )
 
     # Add file handler for errors
-    logger.add(
-        "logs/error.log",
-        format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {name}:{function}:{line} - {message}",
-        level="ERROR",
-        rotation="10 MB",
-        retention="1 week",
-    )
+    try:
+        log_path = Path("logs/error.log")
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        logger.add(
+            str(log_path),
+            format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {name}:{function}:{line} - {message}",
+            level="ERROR",
+            rotation="10 MB",
+            retention="1 week",
+        )
+    except Exception as e:
+        print(f"Failed to setup file logging: {e}")
 
     return logger
