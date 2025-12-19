@@ -132,6 +132,9 @@ class QuizGenerationService:
         except Exception as e:
             logger.error(f"Error generating questions from prompt: {e}")
             raise
+        finally:
+            # Always cleanup database and FAISS index after generation (success or failure)
+            self.cleanup_data()
 
         return questions
 
@@ -338,6 +341,9 @@ class QuizGenerationService:
                 "traceback": error_traceback
             })
             raise
+        finally:
+            # Always cleanup database and FAISS index after generation (success or failure)
+            self.cleanup_data()
 
     async def _select_candidate_chunks(
         self,
@@ -488,6 +494,30 @@ class QuizGenerationService:
             raise
         
         return questions, question_chunk_ids
+
+    def cleanup_data(self):
+        """Clear Neo4j database and FAISS index."""
+        try:
+            logger.info("🧹 Cleaning up database and FAISS index...")
+            
+            # Clear Neo4j database
+            try:
+                self.neo4j_db.execute_write("MATCH (n) DETACH DELETE n")
+                logger.info("✓ Cleared Neo4j database")
+            except Exception as e:
+                logger.error(f"Error clearing Neo4j: {e}")
+            
+            # Clear FAISS index
+            try:
+                self.faiss_index.clear()
+                self.faiss_index.save()
+                logger.info("✓ Cleared FAISS index")
+            except Exception as e:
+                logger.error(f"Error clearing FAISS: {e}")
+            
+            logger.info("✓ Cleanup completed successfully")
+        except Exception as e:
+            logger.error(f"Error during cleanup: {e}")
 
     def close(self):
         
