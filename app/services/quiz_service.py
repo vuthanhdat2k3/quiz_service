@@ -3,10 +3,22 @@ import tempfile
 import uuid
 from typing import List, Optional, Dict, Any
 from pathlib import Path
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 
 from loguru import logger
 import numpy as np
 import aiofiles
+
+# Pre-import SentenceTransformer for faster loading
+try:
+    from sentence_transformers import SentenceTransformer
+    import torch
+    _SENTENCE_TRANSFORMER_AVAILABLE = True
+except ImportError:
+    _SENTENCE_TRANSFORMER_AVAILABLE = False
+    SentenceTransformer = None
+    torch = None
 
 from app.database.neo4j_db import Neo4jDatabase
 from app.database.faiss_index import FAISSIndex
@@ -19,7 +31,49 @@ from app.graph import DocumentGraphBuilder
 from app.services.chunk_selector import ChunkSelector, ChunkSelectionConfig
 
 
+# Global embedding model cache (singleton)
+_embedding_model_cache = {}
+_embedding_model_lock = asyncio.Lock() if asyncio else None
+
+
+def _get_device() -> str:
+    """Get the best available device for embeddings."""
+    if torch is not None and torch.cuda.is_available():
+        return "cuda"
+    elif torch is not None and hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+        return "mps"  # Apple Silicon
+    return "cpu"
+
+
+def _load_embedding_model(model_name: str, device: str = None):
+    """Load and cache embedding model (thread-safe singleton)."""
+    global _embedding_model_cache
+    
+    if model_name in _embedding_model_cache:
+        return _embedding_model_cache[model_name]
+    
+    if not _SENTENCE_TRANSFORMER_AVAILABLE:
+        raise ImportError("sentence-transformers package is required")
+    
+    device = device or _get_device()
+    logger.info(f"🚀 Loading embedding model '{model_name}' on device '{device}'...")
+    
+    model = SentenceTransformer(model_name, device=device)
+    
+    # Optimize for inference
+    if hasattr(model, 'eval'):
+        model.eval()
+    
+    _embedding_model_cache[model_name] = model
+    logger.info(f"✅ Embedding model loaded successfully on {device}")
+    
+    return model
+
+
 class QuizGenerationService:
+
+    # Thread pool for CPU-bound embedding operations
+    _executor = ThreadPoolExecutor(max_workers=2)
 
     def __init__(self):
         self.settings = get_settings()
@@ -35,6 +89,35 @@ class QuizGenerationService:
             include_adjacent=True,
             semantic_weight=0.7
         ))
+        
+        # Pre-load embedding model (lazy initialization)
+        self._embedding_model = None
+        self._device = _get_device()
+    
+    @property
+    def embedding_model(self):
+        """Lazy-load and cache embedding model."""
+        if self._embedding_model is None:
+            self._embedding_model = _load_embedding_model(
+                self.settings.EMBEDDING_MODEL,
+                self._device
+            )
+        return self._embedding_model
+    
+    async def _encode_texts_async(self, texts: List[str], batch_size: int = 64, show_progress: bool = False) -> np.ndarray:
+        """Encode texts asynchronously using thread pool to avoid blocking event loop."""
+        loop = asyncio.get_event_loop()
+        
+        def _encode():
+            return self.embedding_model.encode(
+                texts,
+                convert_to_numpy=True,
+                batch_size=batch_size,
+                show_progress_bar=show_progress,
+                normalize_embeddings=True  # Pre-normalize for cosine similarity
+            )
+        
+        return await loop.run_in_executor(self._executor, _encode)
 
     async def save_uploaded_file(self, file_content: bytes, file_name: str) -> str:
         
@@ -223,28 +306,36 @@ class QuizGenerationService:
                 "relationships_created": graph_stats.get("relationships_created", 0)
             })
 
-            # Step 4: Compute & store embeddings
-            logger.info("🔢 Step 4: Computing embeddings and storing in FAISS...")
-            from sentence_transformers import SentenceTransformer
+            # Step 4: Compute & store embeddings (OPTIMIZED)
+            logger.info(f"🔢 Step 4: Computing embeddings for {len(chunks)} chunks on {self._device}...")
             
-            embedding_model = SentenceTransformer(self.settings.EMBEDDING_MODEL)
             chunk_texts = [c.text for c in chunks]
-            embeddings = embedding_model.encode(chunk_texts, convert_to_numpy=True)
             
-            # Store in FAISS with chunk IDs and metadata for hybrid search
-            metadata_list = []
-            for idx, chunk in enumerate(chunks):
-                metadata_list.append({
+            # Use optimized batch size based on device
+            batch_size = 128 if self._device == "cuda" else 64
+            
+            # Async encoding to avoid blocking event loop
+            embeddings = await self._encode_texts_async(
+                chunk_texts,
+                batch_size=batch_size,
+                show_progress=len(chunks) > 100
+            )
+            
+            # Pre-build metadata list (vectorized approach)
+            metadata_list = [
+                {
                     "document_id": document_id,
                     "chunk_index": idx,
                     "token_count": chunk.token_count,
                     "chunk_type": chunk.chunk_type,
-                    "section_path": chunk.section_path if hasattr(chunk, 'section_path') else [],
+                    "section_path": getattr(chunk, 'section_path', []),
                     "text": chunk.text[:500],  # Store more text for BM25 search
                     "heading": chunk.metadata.get("heading", "")
-                })
+                }
+                for idx, chunk in enumerate(chunks)
+            ]
             
-            self.faiss_index.add_embeddings_batch(chunk_ids, embeddings, metadata_list)
+            self.faiss_index.add_embeddings_batch(chunk_ids, embeddings, metadata_list, already_normalized=True)
             
             logger.info(f"✓ Stored {len(embeddings)} embeddings in FAISS")
             metadata["steps"].append({
@@ -355,8 +446,6 @@ class QuizGenerationService:
         additional_prompt: str = None
     ) -> List[Dict[str, Any]]:
         
-        from sentence_transformers import SentenceTransformer
-        
         # Calculate how many chunks we need
         num_chunks = self.chunk_selector.calculate_chunks_needed(num_questions)
         
@@ -365,7 +454,7 @@ class QuizGenerationService:
             # Mode: Search-based selection with hybrid search
             logger.info(f"🔍 Using search-based selection with prompt: '{additional_prompt[:50]}...'")
             
-            embedding_model = SentenceTransformer(self.settings.EMBEDDING_MODEL)
+            # Use cached embedding model instead of loading again
             
             candidates = self.chunk_selector.select_by_search(
                 query=additional_prompt,
@@ -373,7 +462,7 @@ class QuizGenerationService:
                 chunk_ids=chunk_ids,
                 embeddings=embeddings,
                 faiss_index=self.faiss_index,
-                embedding_model=embedding_model,
+                embedding_model=self.embedding_model,
                 num_chunks=num_chunks,
                 document_id=document_id
             )

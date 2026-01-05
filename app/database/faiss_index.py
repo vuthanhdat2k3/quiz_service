@@ -84,36 +84,54 @@ class FAISSIndex:
             self.metadata[chunk_id] = metadata
 
     def add_embeddings_batch(
-        self, chunk_ids: List[str], embeddings: np.ndarray, metadata_list: Optional[List[Dict[str, Any]]] = None
+        self, chunk_ids: List[str], embeddings: np.ndarray, metadata_list: Optional[List[Dict[str, Any]]] = None,
+        already_normalized: bool = False
     ):
+        """
+        Add multiple embeddings to the index in a single batch operation.
+        
+        Args:
+            chunk_ids: List of chunk IDs
+            embeddings: NumPy array of embeddings (shape: [n_chunks, dimension])
+            metadata_list: Optional list of metadata dicts for each chunk
+            already_normalized: If True, skip normalization (for pre-normalized embeddings)
+        """
         if self.index is None:
             return
 
-        # Normalize embeddings
-        embeddings = embeddings.astype("float32")
-        faiss.normalize_L2(embeddings)
+        # Convert to float32 if needed (FAISS requirement)
+        if embeddings.dtype != np.float32:
+            embeddings = embeddings.astype("float32")
+        
+        # Normalize embeddings only if not already normalized
+        if not already_normalized:
+            faiss.normalize_L2(embeddings)
 
-        # Add to index
+        # Add to index in single operation (faster than individual adds)
         start_id = self.index.ntotal
         self.index.add(embeddings)
 
-        # Update mappings and track duplicates
+        # Batch update mappings using dict comprehension (faster than loop)
+        new_id_map = {start_id + i: chunk_id for i, chunk_id in enumerate(chunk_ids)}
+        self.id_map.update(new_id_map)
+        
+        # Track duplicates and update metadata
+        existing_chunks = set(self.metadata.keys())
         new_chunks = 0
         duplicate_chunks = 0
         
-        for i, chunk_id in enumerate(chunk_ids):
-            faiss_id = start_id + i
-            self.id_map[faiss_id] = chunk_id
-            
-            # Check if this is a duplicate
-            if chunk_id in self.metadata:
-                duplicate_chunks += 1
-            else:
-                new_chunks += 1
-            
-            # Update metadata (will overwrite if duplicate)
-            if metadata_list and i < len(metadata_list):
-                self.metadata[chunk_id] = metadata_list[i]
+        if metadata_list:
+            # Batch update metadata
+            new_metadata = {}
+            for i, (chunk_id, meta) in enumerate(zip(chunk_ids, metadata_list)):
+                if chunk_id in existing_chunks:
+                    duplicate_chunks += 1
+                else:
+                    new_chunks += 1
+                new_metadata[chunk_id] = meta
+            self.metadata.update(new_metadata)
+        else:
+            new_chunks = len(chunk_ids)
 
         logger.info(
             f"Added {len(chunk_ids)} embeddings to FAISS index "

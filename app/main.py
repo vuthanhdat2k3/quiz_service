@@ -1,5 +1,6 @@
 from contextlib import asynccontextmanager
 from pathlib import Path
+import asyncio
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -16,11 +17,32 @@ setup_logging()
 settings = get_settings()
 
 
+async def preload_embedding_model():
+    """Pre-load embedding model in background to avoid cold start latency."""
+    try:
+        logger.info("🔄 Pre-loading embedding model in background...")
+        
+        # Import and load the model
+        from app.services.quiz_service import _load_embedding_model, _get_device
+        
+        device = _get_device()
+        _load_embedding_model(settings.EMBEDDING_MODEL, device)
+        
+        logger.info("✅ Embedding model pre-loaded successfully")
+    except Exception as e:
+        logger.warning(f"⚠️ Failed to pre-load embedding model: {e}")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Starting Quiz Generation Service")
     logger.info(f"Environment: {settings.ENVIRONMENT}")
     logger.info(f"Gemini Model: {settings.GEMINI_MODEL}")
+    logger.info(f"Embedding Model: {settings.EMBEDDING_MODEL}")
+    
+    # Pre-load embedding model in background (non-blocking)
+    asyncio.create_task(preload_embedding_model())
+    
     yield
     logger.info("Shutting down Quiz Generation Service")
 
