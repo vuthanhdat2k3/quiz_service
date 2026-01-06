@@ -157,13 +157,25 @@ Output JSON:"""
         }.get(language, "Generate ALL questions, choices, and explanations in English.")
         
         # Determine question type distribution
-        if 2 in question_types:  # Mix mode
-            type_instruction = "Alternate between SINGLE correct answer and MULTIPLE correct answers (2 correct) questions."
-            answer_format = 'For single-choice: "answer":"A" | For multiple-choice: "answer":["A","B"]'
-        elif 1 in question_types:  # Multiple choice only
+        # 0 = Single choice, 1 = Multiple choice, 2 = Mix mode (explicit)
+        has_single = 0 in question_types
+        has_multiple = 1 in question_types
+        has_mix = 2 in question_types
+        
+        if has_mix or (has_single and has_multiple):  # Mix mode - either explicit or both types requested
+            # Calculate how many of each type
+            single_count = (num_questions + 1) // 2  # Round up for single
+            multiple_count = num_questions - single_count
+            type_instruction = f"""IMPORTANT - Question Type Pattern:
+- Questions 1, 3, 5 (odd numbers): SINGLE correct answer (1 correct choice)
+- Questions 2, 4 (even numbers): MULTIPLE correct answers (exactly 2 correct choices)
+You MUST follow this alternating pattern strictly."""
+            answer_format = '''For ODD questions (single-choice): "answer":"A"
+For EVEN questions (multiple-choice): "answer":["A","B"] (exactly 2 correct answers)'''
+        elif has_multiple:  # Multiple choice only
             type_instruction = "Each question must have exactly 2 correct answers."
             answer_format = '"answer":["A","B"]  // Array of 2 correct answer letters'
-        else:  # Single choice only
+        else:  # Single choice only (default)
             type_instruction = "Each question must have exactly ONE correct answer."
             answer_format = '"answer":"A"  // Single correct answer letter'
         
