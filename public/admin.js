@@ -1,5 +1,8 @@
-// API Base URL
-const API_BASE = '/api/admin';
+// API Base URL - Change this if running from different host
+// Use relative path when served from same origin, or absolute URL for cross-origin
+const API_BASE = window.location.port === '5500' 
+    ? 'http://localhost:8000/api/admin'  // Live Server -> Docker
+    : '/api/admin';                       // Same origin (Docker)
 
 // State
 let documentsPage = 0;

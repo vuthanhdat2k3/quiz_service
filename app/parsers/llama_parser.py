@@ -23,10 +23,16 @@ class LlamaParseParser(BaseParser):
             result_type="markdown",
             verbose=True,
         )
+        
+        # Track current heading context for proper hierarchy
+        self._current_heading_context = []  # Stack of (level, depth)
 
     async def parse(self, file_path: str) -> str:
         try:
             logger.info(f"Parsing document with LlamaParse: {file_path}")
+
+            # Reset heading context for each parse
+            self._current_heading_context = []
 
             # Get JSON result with layout information
             json_result = await self.parser.aget_json(file_path)
@@ -52,6 +58,9 @@ class LlamaParseParser(BaseParser):
         
         # First pass: analyze heading heights to establish thresholds
         heading_stats = self._analyze_heading_heights(pages)
+        
+        # Reset heading context
+        self._current_heading_context = []
         
         # Second pass: build markdown with correct heading levels
         markdown_lines = []
@@ -79,91 +88,91 @@ class LlamaParseParser(BaseParser):
                         markdown_lines.append(md)
                         markdown_lines.append('')
         
-        # Normalize heading levels to remove gaps (H1->H3 becomes H1->H2)
         result = '\n'.join(markdown_lines)
-        return self._normalize_heading_hierarchy(result)
+        
+        # Normalize to remove level gaps while preserving semantic meaning
+        return self._normalize_heading_gaps_only(result)
     
-    def _normalize_heading_hierarchy(self, markdown_content: str) -> str:
+    def _normalize_heading_gaps_only(self, markdown_content: str) -> str:
+        """
+        Normalize headings to remove level gaps while PRESERVING semantic hierarchy.
+        
+        This only compresses gaps (e.g., H1->H3 becomes H1->H2) without changing
+        the relative meaning assigned by _determine_heading_level_contextual.
+        
+        Example: If we have H1, H2, H4 (no H3), it becomes H1, H2, H3.
+        But H2-H2-H2 stays as siblings, not restructured.
+        """
         lines = markdown_content.split('\n')
         heading_regex = re.compile(r'^(#+)\s+(.+)$')
         
-        # First pass: collect all heading levels used
-        heading_levels_used = set()
+        # Collect all heading levels used
+        levels_used = set()
         for line in lines:
             match = heading_regex.match(line.strip())
             if match:
                 level = len(match.group(1))
-                heading_levels_used.add(level)
+                levels_used.add(level)
         
-        if not heading_levels_used:
+        if not levels_used:
             return markdown_content
         
-        # Create mapping from old levels to new normalized levels
-        sorted_levels = sorted(heading_levels_used)
-        level_mapping = {}
-        for new_level, old_level in enumerate(sorted_levels, start=1):
-            level_mapping[old_level] = new_level
+        # Create gap-compression mapping
+        # This preserves relative order but removes unused levels
+        sorted_levels = sorted(levels_used)
+        level_mapping = {old_level: new_level for new_level, old_level in enumerate(sorted_levels, start=1)}
         
-        # Second pass: apply the mapping
-        normalized_lines = []
+        # Apply mapping
+        result_lines = []
         for line in lines:
             match = heading_regex.match(line.strip())
             if match:
                 old_level = len(match.group(1))
                 heading_text = match.group(2)
                 new_level = level_mapping.get(old_level, old_level)
-                normalized_lines.append('#' * new_level + ' ' + heading_text)
+                result_lines.append('#' * new_level + ' ' + heading_text)
             else:
-                normalized_lines.append(line)
+                result_lines.append(line)
         
-        return '\n'.join(normalized_lines)
+        return '\n'.join(result_lines)
     
     def _analyze_heading_heights(self, pages: List[Dict]) -> Dict[str, Any]:
-        # Collect all heading heights and their content
+        """Analyze heading heights and patterns to establish classification rules."""
         headings = []
         for page in pages:
             for item in page.get('items', []):
                 if item.get('type') == 'heading':
                     height = item.get('bBox', {}).get('h', 0)
                     value = item.get('value', '').strip()
+                    numbering_info = self._analyze_numbering(value)
                     headings.append({
                         'height': height,
                         'value': value,
-                        'has_numbering': self._has_numbering_pattern(value),
+                        'numbering_info': numbering_info,
+                        'has_numbering': numbering_info['has_numbering'],
+                        'numbering_depth': numbering_info['depth'],
                         'is_title': self._is_title_pattern(value),
                         'is_ui_element': self._is_likely_ui_element(value),
                     })
         
         if not headings:
-            return {'height_thresholds': [], 'min_valid_height': 10}
+            return {'min_valid_height': 10, 'height_levels': {}}
         
-        # Group headings by structural validity
+        # Group by validity
         valid_headings = [h for h in headings if h['has_numbering'] or h['is_title']]
-        invalid_headings = [h for h in headings if h['is_ui_element']]
         
-        # Determine height threshold
+        # Determine min valid height
+        min_valid_height = 10
         if valid_headings:
-            valid_heights = [h['height'] for h in valid_headings]
-            min_valid = min(valid_heights)
-            # Set threshold slightly below minimum valid height
-            min_valid_height = min_valid * 0.85
-        else:
-            # Fallback: use 10pt as minimum
-            min_valid_height = 10
+            valid_heights = [h['height'] for h in valid_headings if h['height'] > 0]
+            if valid_heights:
+                min_valid_height = min(valid_heights) * 0.85
         
-        # If we have invalid headings, use their max height as additional filter
-        if invalid_headings:
-            invalid_heights = [h['height'] for h in invalid_headings]
-            max_invalid = max(invalid_heights)
-            # If invalid heights overlap with valid, prioritize content analysis
-            if max_invalid >= min_valid_height:
-                min_valid_height = max(min_valid_height, 9)  # At least 9pt
-        
-        # Build height-to-level mapping based on unique heights of valid headings
+        # Build height-to-level mapping for non-numbered headings
         height_levels = {}
         if valid_headings:
-            unique_heights = sorted(set(h['height'] for h in valid_headings), reverse=True)
-            for i, height in enumerate(unique_heights[:6]):  # Max 6 levels
+            unique_heights = sorted(set(h['height'] for h in valid_headings if h['height'] > 0), reverse=True)
+            for i, height in enumerate(unique_heights[:6]):
                 height_levels[height] = i + 1
         
         return {
@@ -172,6 +181,86 @@ class LlamaParseParser(BaseParser):
             'valid_headings': valid_headings,
         }
     
+    def _analyze_numbering(self, text: str) -> Dict[str, Any]:
+        """Analyze numbering pattern and return detailed info."""
+        clean = re.sub(r'^\[[\w\s]+\]\s*', '', text.strip())
+        
+        result = {
+            'has_numbering': False,
+            'type': None,
+            'depth': 0,
+            'parts': []
+        }
+        
+        # Pattern 1: Roman numerals with dots (I., II., III., IV., etc.)
+        roman_match = re.match(r'^([IVXLCDMivxlcdm]+)\s*\.\s+(.+)$', clean)
+        if roman_match:
+            roman = roman_match.group(1).upper()
+            # Validate it's a proper Roman numeral
+            if self._is_valid_roman(roman):
+                result['has_numbering'] = True
+                result['type'] = 'roman'
+                result['depth'] = 1
+                result['parts'] = [roman]
+                return result
+        
+        # Pattern 2: Roman.Arabic (I.1., II.2., etc.)
+        roman_arabic_match = re.match(r'^([IVXLCDMivxlcdm]+)\.(\d+)\s*\.?\s+(.+)$', clean)
+        if roman_arabic_match:
+            roman = roman_arabic_match.group(1).upper()
+            arabic = roman_arabic_match.group(2)
+            if self._is_valid_roman(roman):
+                result['has_numbering'] = True
+                result['type'] = 'roman_arabic'
+                result['depth'] = 2
+                result['parts'] = [roman, arabic]
+                return result
+        
+        # Pattern 3: Arabic decimal numbering (1., 1.1, 1.1.1, etc.)
+        decimal_match = re.match(r'^(\d+(?:\.\d+)*)\s*\.?\s+(.+)$', clean)
+        if decimal_match:
+            parts = decimal_match.group(1).split('.')
+            result['has_numbering'] = True
+            result['type'] = 'decimal'
+            result['depth'] = len(parts)
+            result['parts'] = parts
+            return result
+        
+        # Pattern 4: Single letter (A., B., etc.)
+        letter_match = re.match(r'^([A-Z])\s*\.\s+(.+)$', clean)
+        if letter_match:
+            result['has_numbering'] = True
+            result['type'] = 'letter'
+            result['depth'] = 1
+            result['parts'] = [letter_match.group(1)]
+            return result
+        
+        # Pattern 5: Parenthetical numbering ((1), (a), etc.)
+        paren_match = re.match(r'^\((\d+|[a-z])\)\s+(.+)$', clean)
+        if paren_match:
+            result['has_numbering'] = True
+            result['type'] = 'parenthetical'
+            result['depth'] = 3  # Usually used for sub-sub items
+            result['parts'] = [paren_match.group(1)]
+            return result
+        
+        return result
+    
+    def _is_valid_roman(self, text: str) -> bool:
+        """Check if text is a valid Roman numeral."""
+        if not text:
+            return False
+        
+        text = text.upper()
+        # Simple validation: only valid Roman numeral characters
+        if not re.match(r'^[IVXLCDM]+$', text):
+            return False
+        
+        # Common valid patterns
+        valid_romans = ['I', 'II', 'III', 'IV', 'V', 'VI', 'VII', 'VIII', 'IX', 'X',
+                        'XI', 'XII', 'XIII', 'XIV', 'XV', 'XVI', 'XVII', 'XVIII', 'XIX', 'XX']
+        return text in valid_romans or len(text) <= 4
+    
     def _process_heading_item(self, item: Dict, stats: Dict) -> Optional[str]:
         value = item.get('value', '').strip()
         height = item.get('bBox', {}).get('h', 0)
@@ -179,36 +268,66 @@ class LlamaParseParser(BaseParser):
         if not value:
             return None
         
-        # Rule 1: Filter by height - too small is likely UI element
-        min_valid_height = stats.get('min_valid_height', 10)
-        if height < min_valid_height and not self._has_numbering_pattern(value):
-            # Small text without numbering - likely UI element, return as plain text
-            return value
-        
-        # Rule 2: Check if it's definitely a UI element by content
+        # Rule 1: Filter out UI elements
         if self._is_likely_ui_element(value):
             return value  # Return as plain text
         
-        # Rule 3: Determine heading level
-        level = self._determine_heading_level(value, height, stats)
+        # Rule 2: Check height threshold (but don't filter numbered headings)
+        numbering_info = self._analyze_numbering(value)
+        min_valid_height = stats.get('min_valid_height', 10)
+        
+        if height < min_valid_height and not numbering_info['has_numbering']:
+            return value  # Return as plain text
+        
+        # Rule 3: Determine heading level based on structure
+        level = self._determine_heading_level_contextual(value, height, numbering_info, stats)
         
         if level:
+            # Update heading context
+            self._update_heading_context(level, numbering_info)
             return '#' * level + ' ' + value
         else:
-            return value  # Cannot determine level, return as plain text
+            return value
     
-    def _determine_heading_level(self, value: str, height: float, stats: Dict) -> Optional[int]:
-        # Check numbering pattern first - most reliable
-        numbering_depth = self._get_numbering_depth(value)
-        if numbering_depth > 0:
-            # Map depth to level: depth 1 -> H2, depth 2 -> H3, etc.
-            return min(numbering_depth + 1, 6)
+    def _determine_heading_level_contextual(self, value: str, height: float, 
+                                             numbering_info: Dict, stats: Dict) -> Optional[int]:
+        """Determine heading level using context and structure."""
         
-        # Check if it's a title pattern
+        # Priority 1: Numbered headings
+        if numbering_info['has_numbering']:
+            numbering_type = numbering_info['type']
+            depth = numbering_info['depth']
+            
+            if numbering_type == 'roman':
+                # I., II., III. -> H2 (main sections)
+                return 2
+            elif numbering_type == 'roman_arabic':
+                # I.1, I.2 -> H3 (sub-sections)
+                return 3
+            elif numbering_type == 'decimal':
+                # 1. -> H2, 1.1 -> H3, 1.1.1 -> H4
+                return min(depth + 1, 6)
+            elif numbering_type == 'letter':
+                # A., B. -> H2
+                return 2
+            elif numbering_type == 'parenthetical':
+                # (1), (a) -> H4 or context-based
+                if self._current_heading_context:
+                    return min(self._current_heading_context[-1][0] + 1, 6)
+                return 4
+        
+        # Priority 2: Title patterns
         if self._is_title_pattern(value):
-            return 1  # Top-level heading
+            return 1
         
-        # Use height-based level if available
+        # Priority 3: Context-based level (for non-numbered sub-headings)
+        # If we have a current context, this is likely a sub-heading
+        if self._current_heading_context:
+            parent_level = self._current_heading_context[-1][0]
+            # Non-numbered heading after a numbered one is typically one level deeper
+            return min(parent_level + 1, 6)
+        
+        # Priority 4: Height-based level
         height_levels = stats.get('height_levels', {})
         if height in height_levels:
             return height_levels[height]
@@ -216,52 +335,40 @@ class LlamaParseParser(BaseParser):
         # Find closest height
         if height_levels:
             closest_height = min(height_levels.keys(), key=lambda h: abs(h - height))
-            if abs(closest_height - height) < 3:  # Within 3pt tolerance
+            if abs(closest_height - height) < 3:
                 return height_levels[closest_height]
         
-        # Default: if it passed all filters, assign H2
-        return 2
+        # Default: H3 for unclassified headings (not H2 to avoid conflicts with main sections)
+        return 3
+    
+    def _update_heading_context(self, level: int, numbering_info: Dict):
+        """Update the heading context stack."""
+        depth = numbering_info.get('depth', 0)
+        
+        # Pop levels that are >= current (siblings or children of siblings)
+        while self._current_heading_context and self._current_heading_context[-1][0] >= level:
+            self._current_heading_context.pop()
+        
+        # Push current heading
+        self._current_heading_context.append((level, depth))
     
     def _has_numbering_pattern(self, text: str) -> bool:
-        # Remove bracket prefixes like [ok]
-        clean = re.sub(r'^\[[\w\s]+\]\s*', '', text)
-        
-        patterns = [
-            r'^\d+\.',           # 1.
-            r'^\d+\.\d+',        # 1.1
-            r'^[A-Z]\.',         # A.
-            r'^[IVX]+\.',        # I., II., III.
-            r'^\(\d+\)',        # (1)
-            r'^\([a-z]\)',       # (a)
-        ]
-        
-        for pattern in patterns:
-            if re.match(pattern, clean):
-                return True
-        return False
+        """Quick check if text has any numbering pattern."""
+        return self._analyze_numbering(text)['has_numbering']
     
     def _get_numbering_depth(self, text: str) -> int:
-        clean = re.sub(r'^\[[\w\s]+\]\s*', '', text)
-        
-        # Check decimal numbering: 1.2.3
-        match = re.match(r'^(\d+(?:\.\d+)*)\s*\.?\s+', clean)
-        if match:
-            return len(match.group(1).split('.'))
-        
-        # Single number or letter
-        if re.match(r'^(\d+|[A-Za-z]|[IVXivx]+)\s*[\.\)\:]\s+', clean):
-            return 1
-        
-        return 0
+        """Get the depth of numbering (for compatibility)."""
+        return self._analyze_numbering(text)['depth']
     
     def _is_title_pattern(self, text: str) -> bool:
-        text_lower = text.lower()
+        text_lower = text.lower().strip()
         
         title_patterns = [
             r'^(module|chapter|chương|phần|part|unit|bài|mục)\s*\d*',
             r'^(introduction|conclusion|summary|overview|abstract)',
             r'^(giới thiệu|kết luận|tổng quan|mô tả|tóm tắt)',
             r'^(requirements?|specifications?|mục tiêu|yêu cầu)',
+            r'^(appendix|phụ lục|references?|tài liệu)',
         ]
         
         for pattern in title_patterns:
@@ -274,8 +381,11 @@ class LlamaParseParser(BaseParser):
         original = text.strip()
         
         # 0. Check for bullet/symbol prefixes (these are list items, not headings)
-        if re.match(r'^[◼◻●○•◦▪▸►⇒→\-\*]\s*', original):
-            return True
+        if re.match(r'^[◼◻●○•◦▪▸►⇒→¢¶§]\s*', original):
+            # But allow if it's followed by substantive content that looks like a heading
+            remaining = re.sub(r'^[◼◻●○•◦▪▸►⇒→¢¶§]\s*', '', original)
+            if len(remaining) < 10 or not any(c.isupper() for c in remaining[:5]):
+                return True  # Likely a bullet point
         
         # 1. Exact match UI keywords
         ui_keywords = {
@@ -285,38 +395,35 @@ class LlamaParseParser(BaseParser):
             'chat', 'meet', 'call', 'share', 'post', 'send', 'reply',
             'members', 'owners', 'admins', 'users', 'channels', 'rooms',
             'notifications', 'alerts', 'messages', 'inbox', 'activity', 'feed',
-            'name', 'title', 'description', 'status', 'type', 'date', 'time',
-            'calendar', 'events', 'posts', 'school', 'communities',
         }
         
         if text_lower in ui_keywords:
             return True
         
-        # 2. Patterns like "Word Word Number" (e.g., "Lop lon 3")
-        if re.match(r'^[A-Za-z]+\s+[A-Za-z]+\s*\d*$', original):
-            if not self._is_title_pattern(text):
-                return True
-        
-        # 3. "Number + Word" pattern (e.g., "8 Events")
+        # 2. "Number + Word" pattern (e.g., "8 Events") - likely UI counter
         if re.match(r'^\d+\s+[A-Za-z]+s?$', original):
             return True
         
-        # 4. Very short text (1-2 words) without structure
+        # 3. Very short text (1-2 words) that doesn't look like a heading
         words = text.split()
-        if len(words) <= 2:
+        if len(words) <= 2 and len(text) < 20:
+            # But allow if it has heading-like patterns
             if not self._has_numbering_pattern(text) and not self._is_title_pattern(text):
-                return True
+                # Check if it looks like a section name
+                if not re.match(r'^[A-Z][a-z]+\s+[A-Z][a-z]+', original):
+                    return True
         
-        # 5. Common UI phrases
-        ui_phrases = [
-            r'^add\s+\w+', r'^edit\s+\w+', r'^delete\s+\w+', r'^create\s+\w+',
-            r'^invite\s+\w+', r'^share\s+\w+', r'^manage\s+\w+',
-            r'^welcome\s+to', r"let's\s+start", r'^give\s+your',
-            r'^post\s+in', r'^channel\s+name',
+        # 4. Footer/header patterns
+        footer_patterns = [
+            r'^(page\s+)?\d+$',  # Page numbers
+            r'^\d+\s*/\s*\d+$',  # Page X/Y
+            r'^AI\s+VIET\s+NAM',  # Document footer
+            r'@.*\.edu\.vn',  # Email
+            r'^AIO\d+',  # Course code
         ]
         
-        for pattern in ui_phrases:
-            if re.match(pattern, text_lower):
+        for pattern in footer_patterns:
+            if re.match(pattern, original, re.IGNORECASE):
                 return True
         
         return False
