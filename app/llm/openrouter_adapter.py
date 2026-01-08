@@ -22,6 +22,7 @@ from app.core.config import get_settings
 settings = get_settings()
 
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+OPENROUTER_MODEL=settings.OPENROUTER_MODEL or "google/gemini-2.0-flash-001"
 
 
 class OpenRouterAdapter(LLMAdapter):
@@ -29,7 +30,7 @@ class OpenRouterAdapter(LLMAdapter):
     def __init__(
         self,
         api_key: Optional[str] = None,
-        model_name: str = "google/gemini-2.0-flash-001",
+        model_name: str = OPENROUTER_MODEL,
         **kwargs
     ):
         super().__init__(model_name=model_name, **kwargs)

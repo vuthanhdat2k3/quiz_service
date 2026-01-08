@@ -27,7 +27,7 @@ class Settings(BaseSettings):
 
     # OpenRouter API (for Gemini via OpenRouter)
     OPENROUTER_API_KEY: str = ""
-    OPENROUTER_MODEL: str = "google/gemini-2.0-flash-001"
+    OPENROUTER_MODEL: str = "google/gemini-2.0-flash-exp:free"
 
     # Neo4j Configuration
     NEO4J_URI: str = "bolt://localhost:7687"
@@ -80,7 +80,12 @@ class Settings(BaseSettings):
     # Logging
     LOG_LEVEL: str = "INFO"
 
-    model_config = SettingsConfigDict(env_file=".env", case_sensitive=True)
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        case_sensitive=True,
+        extra="ignore"
+    )
 
     @property
     def allowed_origins_list(self) -> List[str]:

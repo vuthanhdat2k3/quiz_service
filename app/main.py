@@ -37,7 +37,7 @@ async def preload_embedding_model():
 async def lifespan(app: FastAPI):
     logger.info("Starting Quiz Generation Service")
     logger.info(f"Environment: {settings.ENVIRONMENT}")
-    logger.info(f"Gemini Model: {settings.GEMINI_MODEL}")
+    logger.info(f"OpenRouter Model: {settings.OPENROUTER_MODEL}")
     logger.info(f"Embedding Model: {settings.EMBEDDING_MODEL}")
     
     # Pre-load embedding model in background (non-blocking)
