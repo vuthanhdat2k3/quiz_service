@@ -61,18 +61,7 @@ class GeminiAdapter(LLMAdapter):
                 else:
                     raise
 
-    def _extract_json(self, text: str) -> Dict[str, Any]:
-        # Try to find JSON in code blocks
-        if "```json" in text:
-            start = text.find("```json") + 7
-            end = text.find("```", start)
-            text = text[start:end].strip()
-        elif "```" in text:
-            start = text.find("```") + 3
-            end = text.find("```", start)
-            text = text[start:end].strip()
-
-        return json.loads(text)
+    # Note: _repair_json and _extract_json are inherited from LLMAdapter base class
 
     async def generate_mcq(
         self, passage: str, options: Optional[Dict[str, Any]] = None
@@ -105,6 +94,7 @@ class GeminiAdapter(LLMAdapter):
         try:
             data = self._extract_json(response_text)
             
+            # _extract_json already validates and returns {'questions': [...]}
             # Handle both array and object with "questions" key
             if isinstance(data, dict) and "questions" in data:
                 questions_data = data["questions"]
@@ -114,16 +104,28 @@ class GeminiAdapter(LLMAdapter):
                 raise ValueError(f"Expected array or object with 'questions' key, got {type(data)}")
             
             questions = []
-            for q_data in questions_data:
+            required_keys = {'question', 'choices', 'answer'}
+            
+            for idx, q_data in enumerate(questions_data):
+                # Skip incomplete questions (already filtered by _extract_json, but double-check)
+                if not isinstance(q_data, dict):
+                    logger.warning(f"Skipping non-dict question at index {idx}")
+                    continue
+                    
+                missing_keys = required_keys - set(q_data.keys())
+                if missing_keys:
+                    logger.warning(f"Skipping question {idx} missing keys: {missing_keys}")
+                    continue
+                
                 # Clean up choices if they have letter prefixes like "A) ..."
                 choices = q_data.get("choices", [])
                 cleaned_choices = []
                 for choice in choices:
                     # Remove "A) ", "B) ", etc. prefixes if present
-                    if len(choice) > 2 and choice[1] in ")]:.-" and choice[0].upper() in "ABCD":
+                    if isinstance(choice, str) and len(choice) > 2 and choice[1] in ")]:.-" and choice[0].upper() in "ABCD":
                         cleaned_choices.append(choice[2:].strip())
                     else:
-                        cleaned_choices.append(choice)
+                        cleaned_choices.append(str(choice) if choice else "")
                 
                 questions.append(MCQResult(
                     question=q_data["question"],
@@ -133,11 +135,14 @@ class GeminiAdapter(LLMAdapter):
                     difficulty=q_data.get("difficulty", "medium"),
                 ))
             
+            if not questions:
+                raise ValueError("No valid questions generated after filtering incomplete responses")
+            
             logger.info(f"Generated {len(questions)} questions in single API call")
             return BatchMCQResult(questions=questions)
             
         except (json.JSONDecodeError, KeyError, ValueError) as e:
-            logger.error(f"Failed to parse batch MCQ response: {e}\nResponse: {response_text}")
+            logger.error(f"Failed to parse batch MCQ response: {e}\\nResponse: {response_text[:500]}")
             raise
 
     async def refine_distractors(

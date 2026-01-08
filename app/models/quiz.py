@@ -7,13 +7,34 @@ from pydantic import BaseModel, Field
 class QuestionTypeEnum(int, Enum):
     SINGLE_CHOICE = 0
     MULTIPLE_CHOICE = 1
-    MIX = 2  # Mix of single and multiple choice questions
 
 
 class DifficultyEnum(str, Enum):
     EASY = "easy"
     MEDIUM = "medium"
     HARD = "hard"
+
+
+class PointStrategyEnum(str, Enum):
+    EQUAL = "equal"
+    DIFFICULTY_WEIGHTED = "difficulty_weighted"
+
+
+class DifficultyDistribution(BaseModel):
+    easy: int = Field(default=3, ge=0, description="Số câu hỏi dễ")
+    medium: int = Field(default=4, ge=0, description="Số câu hỏi trung bình")
+    hard: int = Field(default=3, ge=0, description="Số câu hỏi khó")
+
+    def total(self) -> int:
+        return self.easy + self.medium + self.hard
+
+
+class QuestionTypeDistribution(BaseModel):
+    single: int = Field(default=5, ge=0, description="Số câu hỏi single choice")
+    multiple: int = Field(default=5, ge=0, description="Số câu hỏi multiple choice")
+
+    def total(self) -> int:
+        return self.single + self.multiple
 
 
 class QuizOption(BaseModel):
@@ -26,44 +47,56 @@ class QuizQuestion(BaseModel):
     id: Optional[int] = 0
     questionText: str = Field(..., min_length=1, description="Question text")
     questionType: QuestionTypeEnum = Field(..., description="Type of question")
+    difficulty: DifficultyEnum = Field(..., description="Difficulty level of the question")
     point: float = Field(default=1.0, ge=0, description="Points for this question")
     options: List[QuizOption] = Field(..., min_items=2, description="Answer options")
 
 
 class GenerateFromPromptRequest(BaseModel):
     prompt: str = Field(..., min_length=1, description="Prompt to generate quiz from")
-    num_questions: int = Field(
-        default=10, ge=1, le=30, description="Number of questions to generate"
+    difficulty_distribution: DifficultyDistribution = Field(
+        default_factory=DifficultyDistribution,
+        description="Số câu theo từng độ khó"
     )
-    difficulty: DifficultyEnum = Field(
-        default=DifficultyEnum.MEDIUM, description="Difficulty level"
+    question_type_distribution: QuestionTypeDistribution = Field(
+        default_factory=QuestionTypeDistribution,
+        description="Số câu theo loại (single/multiple)"
     )
     language: str = Field(default="vi", description="Language for questions (e.g., 'vi', 'en')")
-    question_types: List[int] = Field(
-        default=[2], description="Question types: 0=Single Choice, 1=Multiple Choice, 2=Mix (default)"
+    total_points: float = Field(default=10.0, gt=0, description="Tổng điểm của bộ câu hỏi")
+    point_strategy: PointStrategyEnum = Field(
+        default=PointStrategyEnum.EQUAL,
+        description="Cách chia điểm: chia đều hoặc ưu tiên câu dễ"
     )
 
 
 class GenerateFromFileParams(BaseModel):
-    num_questions: Optional[int] = Field(
-        default=10, ge=1, le=30, description="Number of questions to generate"
+    difficulty_distribution: Optional[DifficultyDistribution] = Field(
+        default=None, description="Số câu theo từng độ khó"
     )
-    difficulty: Optional[str] = Field(default="medium", description="Difficulty level")
+    question_type_distribution: Optional[QuestionTypeDistribution] = Field(
+        default=None, description="Số câu theo loại (single/multiple)"
+    )
     language: Optional[str] = Field(
         default="vi", description="Language for questions (e.g., 'vi', 'en')"
-    )
-    question_types: Optional[List[int]] = Field(
-        default=[2], description="Question types: 0=Single Choice, 1=Multiple Choice, 2=Mix (default)"
     )
     prompt: Optional[str] = Field(
         default=None, description="Additional prompt for quiz generation"
     )
+    total_points: float = Field(default=10.0, gt=0, description="Tổng điểm của bộ câu hỏi")
+    point_strategy: PointStrategyEnum = Field(
+        default=PointStrategyEnum.EQUAL,
+        description="Cách chia điểm: chia đều hoặc ưu tiên câu dễ"
+    )
 
 
 class QuizMetadata(BaseModel):
-    difficulty: str
+    difficulty_distribution: DifficultyDistribution
+    question_type_distribution: QuestionTypeDistribution
     language: str
     source: str
+    total_points: float
+    point_strategy: PointStrategyEnum
     prompt: Optional[str] = None
     file_name: Optional[str] = None
 

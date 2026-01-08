@@ -48,6 +48,7 @@ coverage.xml
 .hypothesis/
 .pytest_cache/
 pytest_cache/
+tests/
 
 # Translations
 *.mo
@@ -179,6 +180,7 @@ sample_documents/
 *.docx
 *.ppt
 *.pptx
+documents/
 
 # Secrets and credentials
 *.pem

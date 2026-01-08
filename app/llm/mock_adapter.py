@@ -49,10 +49,25 @@ class MockLLMAdapter(LLMAdapter):
     ) -> BatchMCQResult:
         """Generate multiple mock MCQ questions"""
         questions = []
-        
-        for i in range(num_questions):
+
+        plan = []
+        if options:
+            plan = options.get("question_plan", [])
+
+        total = len(plan) if plan else num_questions
+
+        for i in range(total):
             passage_hash = hashlib.md5(f"{passage}_{i}".encode()).hexdigest()[:8]
-            
+
+            if plan and i < len(plan):
+                difficulty = plan[i].get("difficulty", "medium") if isinstance(plan[i], dict) else str(plan[i])
+                q_type_label = plan[i].get("type", "single_choice") if isinstance(plan[i], dict) else "single_choice"
+            else:
+                difficulty = "medium"
+                q_type_label = "single_choice" if i % 2 == 0 else "multiple_choice"
+
+            answer_value = "A" if q_type_label == "single_choice" else ["A", "B"]
+
             questions.append(MCQResult(
                 question=f"Question {i+1}: What concept is discussed? (mock-{passage_hash})",
                 choices=[
@@ -61,12 +76,12 @@ class MockLLMAdapter(LLMAdapter):
                     f"Option C for question {i+1}",
                     f"Option D for question {i+1}",
                 ],
-                answer="A" if i % 2 == 0 else ["A", "B"],
+                answer=answer_value,
                 explanation=f"Mock explanation for question {i+1}",
-                difficulty="medium",
+                difficulty=difficulty,
             ))
-        
-        logger.debug(f"Mock generated {num_questions} batch MCQ questions")
+
+        logger.debug(f"Mock generated {total} batch MCQ questions")
         return BatchMCQResult(questions=questions)
 
     async def refine_distractors(

@@ -1,5 +1,7 @@
+import json
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from loguru import logger
+from pydantic import ValidationError
 
 from app.core.config import get_settings
 from app.models.quiz import (
@@ -7,6 +9,9 @@ from app.models.quiz import (
     GenerateFromFileResponse,
     GenerateFromPromptRequest,
     GenerateFromPromptResponse,
+    DifficultyDistribution,
+    QuestionTypeDistribution,
+    PointStrategyEnum,
     QuizMetadata,
 )
 from app.services.quiz_service import QuizGenerationService
@@ -23,7 +28,26 @@ settings = get_settings()
 )
 async def generate_from_prompt(request: GenerateFromPromptRequest):
     try:
-        logger.info(f"Received request to generate {request.num_questions} questions from prompt")
+        total_questions = request.difficulty_distribution.total()
+        logger.info(
+            f"Received request to generate {total_questions} questions from prompt with plan: "
+            f"{request.difficulty_distribution.dict()} | {request.question_type_distribution.dict()}"
+        )
+
+        if total_questions < 1:
+            raise HTTPException(status_code=400, detail="Tổng số câu hỏi phải lớn hơn 0")
+        if total_questions > settings.MAX_NUM_QUESTIONS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Tổng số câu hỏi không được vượt quá {settings.MAX_NUM_QUESTIONS}",
+            )
+        if request.question_type_distribution.total() != total_questions:
+            raise HTTPException(
+                status_code=400,
+                detail="Số câu theo loại (single/multiple) phải bằng tổng số câu theo độ khó",
+            )
+        if request.total_points <= 0:
+            raise HTTPException(status_code=400, detail="total_points must be greater than 0")
 
         # Initialize service
         service = QuizGenerationService()
@@ -31,18 +55,22 @@ async def generate_from_prompt(request: GenerateFromPromptRequest):
         # Generate questions
         questions = await service.generate_from_prompt(
             prompt=request.prompt,
-            num_questions=request.num_questions,
-            difficulty=request.difficulty.value,
             language=request.language,
-            question_types=request.question_types,
+            difficulty_distribution=request.difficulty_distribution,
+            question_type_distribution=request.question_type_distribution,
+            total_points=request.total_points,
+            point_strategy=request.point_strategy,
         )
 
         # Build metadata
         metadata = QuizMetadata(
-            difficulty=request.difficulty.value,
+            difficulty_distribution=request.difficulty_distribution,
+            question_type_distribution=request.question_type_distribution,
             language=request.language,
             source="prompt",
             prompt=request.prompt,
+            total_points=request.total_points,
+            point_strategy=request.point_strategy,
         )
 
         response = GenerateFromPromptResponse(
@@ -86,10 +114,11 @@ async def generate_from_prompt(request: GenerateFromPromptRequest):
 )
 async def generate_from_file(
     file: UploadFile = File(...),
-    num_questions: int = Form(default=10),
-    difficulty: str = Form(default="medium"),
+    difficulty_distribution: str = Form(default='{"easy":3,"medium":4,"hard":3}'),
+    question_type_distribution: str = Form(default='{"single":5,"multiple":5}'),
     language: str = Form(default="vi"),
-    question_types: str = Form(default="0,1,2"),
+    total_points: float = Form(default=10.0),
+    point_strategy: str = Form(default="equal"),
     prompt: str = Form(default=None),
 ):
     temp_file_path = None
@@ -97,7 +126,7 @@ async def generate_from_file(
     try:
         logger.info(
             f"Received file upload: {file.filename} "
-            f"(type: {file.content_type}, num_questions: {num_questions})"
+            f"(type: {file.content_type})"
         )
 
         # Validate file extension
@@ -117,25 +146,40 @@ async def generate_from_file(
                 detail=f"File too large. Maximum size: {settings.MAX_FILE_SIZE_MB}MB",
             )
 
-        # Parse question types
+        # Parse distributions
         try:
-            question_type_list = [int(t.strip()) for t in question_types.split(",")]
-        except ValueError:
-            raise HTTPException(
-                status_code=400, detail="Invalid question_types format"
-            )
+            difficulty_payload = json.loads(difficulty_distribution)
+            type_payload = json.loads(question_type_distribution)
+        except json.JSONDecodeError:
+            raise HTTPException(status_code=400, detail="difficulty_distribution/question_type_distribution must be valid JSON")
 
-        # Validate parameters
-        if num_questions < 1 or num_questions > settings.MAX_NUM_QUESTIONS:
+        try:
+            difficulty_obj = DifficultyDistribution(**difficulty_payload)
+            type_obj = QuestionTypeDistribution(**type_payload)
+        except ValidationError as e:
+            raise HTTPException(status_code=400, detail=f"Invalid distribution payload: {e}")
+
+        total_questions = difficulty_obj.total()
+        if total_questions < 1:
+            raise HTTPException(status_code=400, detail="Tổng số câu hỏi phải lớn hơn 0")
+        if total_questions > settings.MAX_NUM_QUESTIONS:
             raise HTTPException(
                 status_code=400,
-                detail=f"num_questions must be between 1 and {settings.MAX_NUM_QUESTIONS}",
+                detail=f"Tổng số câu hỏi không được vượt quá {settings.MAX_NUM_QUESTIONS}",
+            )
+        if type_obj.total() != total_questions:
+            raise HTTPException(
+                status_code=400,
+                detail="Số câu theo loại (single/multiple) phải bằng tổng số câu theo độ khó",
             )
 
-        if difficulty not in ["easy", "medium", "hard"]:
-            raise HTTPException(
-                status_code=400, detail="difficulty must be easy, medium, or hard"
-            )
+        try:
+            point_strategy_enum = PointStrategyEnum(point_strategy)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="point_strategy must be 'equal' or 'difficulty_weighted'")
+
+        if total_points <= 0:
+            raise HTTPException(status_code=400, detail="total_points must be greater than 0")
 
         # Initialize service
         service = QuizGenerationService()
@@ -146,21 +190,25 @@ async def generate_from_file(
         # Generate questions from file using full pipeline
         questions, file_name, parsed_text, chunks, pipeline_metadata = await service.generate_from_file_advanced(
             file_path=temp_file_path,
-            num_questions=num_questions,
-            difficulty=difficulty,
+            difficulty_distribution=difficulty_obj,
+            question_type_distribution=type_obj,
             language=language,
-            question_types=question_type_list,
+            total_points=total_points,
+            point_strategy=point_strategy_enum,
             additional_prompt=prompt,
         )
         logger.info(f"Pipeline metadata: {pipeline_metadata}")
 
         # Build metadata
         metadata = QuizMetadata(
-            difficulty=difficulty,
+            difficulty_distribution=difficulty_obj,
+            question_type_distribution=type_obj,
             language=language,
             source="file",
             file_name=file_name,
             prompt=prompt,
+            total_points=total_points,
+            point_strategy=point_strategy_enum,
         )
 
         response = GenerateFromFileResponse(

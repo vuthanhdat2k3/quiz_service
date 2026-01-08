@@ -62,7 +62,7 @@ class OpenAIAdapter(LLMAdapter):
         response_text = await self._call_with_retry(prompt)
 
         try:
-            data = json.loads(response_text)
+            data = self._extract_json(response_text)
             return MCQResult(
                 question=data["question"],
                 choices=data["choices"],
@@ -70,8 +70,8 @@ class OpenAIAdapter(LLMAdapter):
                 explanation=data["explanation"],
                 difficulty=data["difficulty"],
             )
-        except (json.JSONDecodeError, KeyError) as e:
-            logger.error(f"Failed to parse MCQ response: {e}")
+        except (json.JSONDecodeError, KeyError, ValueError) as e:
+            logger.error(f"Failed to parse MCQ response: {e}\nRaw response: {response_text[:500]}")
             raise
 
     async def generate_batch_mcq(
@@ -83,7 +83,7 @@ class OpenAIAdapter(LLMAdapter):
         response_text = await self._call_with_retry(prompt)
 
         try:
-            data = json.loads(response_text)
+            data = self._extract_json(response_text)
             
             if isinstance(data, dict) and "questions" in data:
                 questions_data = data["questions"]
@@ -93,14 +93,26 @@ class OpenAIAdapter(LLMAdapter):
                 raise ValueError(f"Expected array or object with 'questions' key, got {type(data)}")
             
             questions = []
-            for q_data in questions_data:
+            required_keys = {'question', 'choices', 'answer'}
+            
+            for idx, q_data in enumerate(questions_data):
+                # Skip incomplete questions
+                if not isinstance(q_data, dict):
+                    logger.warning(f"Skipping non-dict question at index {idx}")
+                    continue
+                    
+                missing_keys = required_keys - set(q_data.keys())
+                if missing_keys:
+                    logger.warning(f"Skipping question {idx} missing keys: {missing_keys}")
+                    continue
+                
                 choices = q_data.get("choices", [])
                 cleaned_choices = []
                 for choice in choices:
-                    if len(choice) > 2 and choice[1] in ")]:.-" and choice[0].upper() in "ABCD":
+                    if isinstance(choice, str) and len(choice) > 2 and choice[1] in ")]:.-" and choice[0].upper() in "ABCD":
                         cleaned_choices.append(choice[2:].strip())
                     else:
-                        cleaned_choices.append(choice)
+                        cleaned_choices.append(str(choice) if choice else "")
                 
                 questions.append(MCQResult(
                     question=q_data["question"],
@@ -110,11 +122,14 @@ class OpenAIAdapter(LLMAdapter):
                     difficulty=q_data.get("difficulty", "medium"),
                 ))
             
+            if not questions:
+                raise ValueError("No valid questions generated after filtering incomplete responses")
+            
             logger.info(f"Generated {len(questions)} questions in single API call")
             return BatchMCQResult(questions=questions)
             
         except (json.JSONDecodeError, KeyError, ValueError) as e:
-            logger.error(f"Failed to parse batch MCQ response: {e}")
+            logger.error(f"Failed to parse batch MCQ response: {e}\\nRaw response: {response_text[:500]}")
             raise
 
     async def refine_distractors(
@@ -124,12 +139,12 @@ class OpenAIAdapter(LLMAdapter):
         response_text = await self._call_with_retry(prompt)
 
         try:
-            distractors = json.loads(response_text)
+            distractors = self._extract_json(response_text)
             if not isinstance(distractors, list) or len(distractors) != 3:
                 raise ValueError(f"Expected 3 distractors, got {len(distractors)}")
             return DistractorResult(distractors=distractors)
         except (json.JSONDecodeError, ValueError) as e:
-            logger.error(f"Failed to parse distractor response: {e}")
+            logger.error(f"Failed to parse distractor response: {e}\nRaw response: {response_text[:500]}")
             raise
 
     async def generate_short_answer(
@@ -139,15 +154,15 @@ class OpenAIAdapter(LLMAdapter):
         response_text = await self._call_with_retry(prompt)
 
         try:
-            data = json.loads(response_text)
+            data = self._extract_json(response_text)
             return ShortAnswerResult(
                 question=data["question"],
                 answer=data["answer"],
                 explanation=data["explanation"],
                 difficulty=data["difficulty"],
             )
-        except (json.JSONDecodeError, KeyError) as e:
-            logger.error(f"Failed to parse short answer response: {e}")
+        except (json.JSONDecodeError, KeyError, ValueError) as e:
+            logger.error(f"Failed to parse short answer response: {e}\nRaw response: {response_text[:500]}")
             raise
 
     async def generate_true_false(
@@ -157,13 +172,13 @@ class OpenAIAdapter(LLMAdapter):
         response_text = await self._call_with_retry(prompt)
 
         try:
-            data = json.loads(response_text)
+            data = self._extract_json(response_text)
             return TrueFalseResult(
                 statement=data["statement"],
                 answer=data["answer"],
                 explanation=data["explanation"],
                 difficulty=data["difficulty"],
             )
-        except (json.JSONDecodeError, KeyError) as e:
-            logger.error(f"Failed to parse true/false response: {e}")
+        except (json.JSONDecodeError, KeyError, ValueError) as e:
+            logger.error(f"Failed to parse true/false response: {e}\nRaw response: {response_text[:500]}")
             raise

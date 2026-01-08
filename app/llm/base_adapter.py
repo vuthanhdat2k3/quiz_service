@@ -1,6 +1,27 @@
 from abc import ABC, abstractmethod
 from typing import List, Dict, Any, Optional, Union
 from dataclasses import dataclass
+import json
+import re
+from loguru import logger
+
+from app.llm.prompts import (
+    MCQ_PROMPT_TEMPLATE,
+    BATCH_MCQ_PROMPT_TEMPLATE,
+    DISTRACTOR_PROMPT_TEMPLATE,
+    SHORT_ANSWER_PROMPT_TEMPLATE,
+    TRUE_FALSE_PROMPT_TEMPLATE,
+    LANGUAGE_INSTRUCTIONS,
+    LANGUAGE_INSTRUCTIONS_ALL,
+    LANGUAGE_INSTRUCTIONS_SHORT,
+    LANGUAGE_INSTRUCTIONS_TF,
+    VARIETY_HINTS,
+    SINGLE_CHOICE_INSTRUCTION,
+    MULTIPLE_CHOICE_INSTRUCTION_TEMPLATE,
+    SINGLE_ANSWER_FORMAT,
+    MULTIPLE_ANSWER_FORMAT,
+    AVOID_DUPLICATION_TEMPLATE,
+)
 
 
 @dataclass
@@ -50,6 +71,218 @@ class LLMAdapter(ABC):
         self.temperature = temperature
         self.max_retries = max_retries
 
+    def _repair_json(self, text: str) -> str:
+        """
+        Attempt to repair common JSON issues from LLM output.
+        Handles: unterminated strings, missing brackets, trailing commas.
+        """
+        original_text = text
+        
+        # Step 1: Try to find the start of JSON array or object
+        json_start = -1
+        for i, char in enumerate(text):
+            if char in '[{':
+                json_start = i
+                break
+        
+        if json_start == -1:
+            return text
+        
+        text = text[json_start:]
+        
+        # Step 2: Count brackets to find where JSON should end
+        bracket_stack = []
+        in_string = False
+        escape_next = False
+        last_valid_pos = 0
+        
+        for i, char in enumerate(text):
+            if escape_next:
+                escape_next = False
+                continue
+            
+            if char == '\\' and in_string:
+                escape_next = True
+                continue
+            
+            if char == '"' and not escape_next:
+                in_string = not in_string
+                last_valid_pos = i
+                continue
+            
+            if not in_string:
+                if char in '[{':
+                    bracket_stack.append(char)
+                    last_valid_pos = i
+                elif char == ']':
+                    if bracket_stack and bracket_stack[-1] == '[':
+                        bracket_stack.pop()
+                        last_valid_pos = i
+                elif char == '}':
+                    if bracket_stack and bracket_stack[-1] == '{':
+                        bracket_stack.pop()
+                        last_valid_pos = i
+                elif char not in ' \t\n\r':
+                    last_valid_pos = i
+        
+        # Step 3: If we're still inside a string (unterminated), find last complete object
+        if in_string or bracket_stack:
+            # Strategy: Find the last complete question object by looking for "},"
+            # which indicates a complete object in an array
+            
+            # Find all positions of complete objects (ending with },)
+            complete_obj_positions = []
+            search_pos = 0
+            while True:
+                pos = text.find('},', search_pos)
+                if pos == -1:
+                    break
+                complete_obj_positions.append(pos + 1)  # Include the }
+                search_pos = pos + 1
+            
+            # Also check for complete object at end (just })
+            # But we need to verify the bracket count
+            if complete_obj_positions:
+                # Truncate to the last complete object
+                truncate_pos = complete_obj_positions[-1]
+                text = text[:truncate_pos + 1]  # Include the closing }
+                
+                # Recalculate bracket stack
+                bracket_stack = []
+                in_string = False
+                escape_next = False
+                for char in text:
+                    if escape_next:
+                        escape_next = False
+                        continue
+                    if char == '\\' and in_string:
+                        escape_next = True
+                        continue
+                    if char == '"' and not escape_next:
+                        in_string = not in_string
+                        continue
+                    if not in_string:
+                        if char == '[':
+                            bracket_stack.append('[')
+                        elif char == '{':
+                            bracket_stack.append('{')
+                        elif char == ']' and bracket_stack and bracket_stack[-1] == '[':
+                            bracket_stack.pop()
+                        elif char == '}' and bracket_stack and bracket_stack[-1] == '{':
+                            bracket_stack.pop()
+            else:
+                # No complete objects found, try original truncation logic
+                last_quote = text.rfind('"', 0, len(text) - 1)
+                if last_quote > 0:
+                    truncate_pos = last_quote
+                    for j in range(last_quote - 1, -1, -1):
+                        if text[j] == ',':
+                            truncate_pos = j
+                            break
+                        elif text[j] in '[{':
+                            truncate_pos = j + 1
+                            break
+                    
+                    text = text[:truncate_pos].rstrip(',').rstrip()
+                    # Recalculate bracket stack
+                    bracket_stack = []
+                    for char in text:
+                        if char == '[':
+                            bracket_stack.append('[')
+                        elif char == '{':
+                            bracket_stack.append('{')
+                        elif char == ']' and bracket_stack and bracket_stack[-1] == '[':
+                            bracket_stack.pop()
+                        elif char == '}' and bracket_stack and bracket_stack[-1] == '{':
+                            bracket_stack.pop()
+        
+        # Step 4: Remove trailing commas before closing brackets
+        text = re.sub(r',\s*([\]}])', r'\1', text)
+        
+        # Step 5: Close any unclosed brackets
+        while bracket_stack:
+            bracket = bracket_stack.pop()
+            if bracket == '[':
+                text += ']'
+            elif bracket == '{':
+                text += '}'
+        
+        logger.debug(f"JSON repair: original length={len(original_text)}, repaired length={len(text)}")
+        
+        return text
+
+    def _validate_and_filter_questions(self, data: Any) -> Dict[str, Any]:
+        """
+        Validate parsed JSON and filter out incomplete questions.
+        """
+        required_keys = {'question', 'choices', 'answer'}
+        
+        # Handle both array and object with "questions" key
+        if isinstance(data, dict) and 'questions' in data:
+            questions_data = data['questions']
+        elif isinstance(data, list):
+            questions_data = data
+            data = {'questions': questions_data}
+        else:
+            return data  # Return as-is if not a questions array
+        
+        # Filter to keep only complete questions
+        valid_questions = []
+        for q in questions_data:
+            if isinstance(q, dict) and required_keys.issubset(q.keys()):
+                valid_questions.append(q)
+            else:
+                missing = required_keys - set(q.keys()) if isinstance(q, dict) else required_keys
+                logger.warning(f"Skipping incomplete question (missing: {missing})")
+        
+        if len(valid_questions) < len(questions_data):
+            logger.warning(f"Filtered {len(questions_data) - len(valid_questions)} incomplete questions")
+        
+        if not valid_questions:
+            raise ValueError("No complete questions found in LLM response after filtering")
+        
+        data['questions'] = valid_questions
+        return data
+
+    def _extract_json(self, text: str) -> Dict[str, Any]:
+        """Extract and parse JSON from LLM response, with auto-repair for common issues."""
+        original_text = text
+        
+        # Try to find JSON in code blocks
+        if "```json" in text:
+            start = text.find("```json") + 7
+            end = text.find("```", start)
+            if end == -1:  # No closing ```, take rest of text
+                text = text[start:].strip()
+            else:
+                text = text[start:end].strip()
+        elif "```" in text:
+            start = text.find("```") + 3
+            end = text.find("```", start)
+            if end == -1:
+                text = text[start:].strip()
+            else:
+                text = text[start:end].strip()
+
+        # First attempt: try parsing as-is
+        try:
+            result = json.loads(text)
+            return self._validate_and_filter_questions(result)
+        except json.JSONDecodeError as e:
+            logger.warning(f"Initial JSON parse failed: {e}. Attempting repair...")
+        
+        # Second attempt: try to repair the JSON
+        repaired_text = self._repair_json(text)
+        try:
+            result = json.loads(repaired_text)
+            logger.info("JSON repair successful!")
+            return self._validate_and_filter_questions(result)
+        except json.JSONDecodeError as e:
+            logger.error(f"JSON repair failed: {e}")
+            logger.error(f"Original text (first 500 chars): {original_text[:500]}")
+            logger.error(f"Repaired text (first 500 chars): {repaired_text[:500]}")
+            raise ValueError(f"Failed to parse LLM response as JSON: {e}. The LLM may have returned truncated output.")
+
     @abstractmethod
     async def generate_mcq(self, passage: str, options: Optional[Dict[str, Any]] = None) -> MCQResult:
         pass
@@ -78,6 +311,7 @@ class LLMAdapter(ABC):
         pass
 
     def _build_mcq_prompt(self, passage: str, options: Optional[Dict[str, Any]] = None) -> str:
+        """Build prompt for generating a single MCQ question"""
         num_correct = 1
         language = "en"
         difficulty = "medium"
@@ -91,178 +325,109 @@ class LLMAdapter(ABC):
             existing_questions = options.get("existing_questions", [])
             question_index = options.get("question_index", 0)
         
-        # Language instruction mapping
-        lang_instruction = {
-            "vi": "Generate the question, choices, and explanation in Vietnamese (Tiếng Việt).",
-            "en": "Generate the question, choices, and explanation in English.",
-        }.get(language, "Generate the question, choices, and explanation in English.")
+        # Get language instruction
+        lang_instruction = LANGUAGE_INSTRUCTIONS.get(language, LANGUAGE_INSTRUCTIONS["en"])
         
+        # Determine instruction and answer format based on num_correct
         if num_correct == 1:
-            instruction = "generate ONE multiple-choice question with exactly ONE correct answer"
-            answer_format = '"answer":"A|B|C|D"'
+            instruction = SINGLE_CHOICE_INSTRUCTION
+            answer_format = SINGLE_ANSWER_FORMAT
         else:
-            instruction = f"generate ONE multiple-choice question with exactly {num_correct} correct answers"
-            answer_format = '"answer":["A","B"]  // Array of correct answer letters'
+            instruction = MULTIPLE_CHOICE_INSTRUCTION_TEMPLATE.format(num_correct=num_correct)
+            answer_format = MULTIPLE_ANSWER_FORMAT
         
         # Build existing questions context to avoid duplicates
         avoid_section = ""
         if existing_questions:
-            avoid_section = f"""
-IMPORTANT: Do NOT create questions similar to these existing ones:
-{chr(10).join(f'- {q}' for q in existing_questions[-5:])}
-
-Create a UNIQUE and DIFFERENT question that tests a different aspect or concept from the topic.
-"""
+            questions_list = '\n'.join(f'- {q}' for q in existing_questions[-5:])
+            avoid_section = AVOID_DUPLICATION_TEMPLATE.format(existing_questions_list=questions_list)
         
-        # Add variety instruction based on question index
-        variety_hints = [
-            "Focus on definitions and key concepts.",
-            "Focus on applications and examples.",
-            "Focus on relationships and comparisons.",
-            "Focus on causes and effects.",
-            "Focus on processes and procedures.",
-            "Focus on advantages and disadvantages.",
-            "Focus on specific details and facts.",
-        ]
-        variety_instruction = variety_hints[question_index % len(variety_hints)]
+        # Get variety hint based on question index
+        variety_hint = VARIETY_HINTS[question_index % len(VARIETY_HINTS)]
         
-        return f"""You are an exam question generator for academic content. Given the content below, {instruction} that tests understanding of the content.
-
-{lang_instruction}
-
-Question #{question_index + 1} focus: {variety_instruction}
-{avoid_section}
-Output only JSON with exactly these keys: {{"question":"", "choices":["","","",""], {answer_format}, "explanation":"", "difficulty":"easy|medium|hard"}}
-
-Content:
-"{passage}"
-
-Output JSON:"""
+        # Build final prompt using template
+        return MCQ_PROMPT_TEMPLATE.format(
+            instruction=instruction,
+            lang_instruction=lang_instruction,
+            question_number=question_index + 1,
+            variety_hint=variety_hint,
+            avoid_section=avoid_section,
+            answer_format=answer_format,
+            passage=passage
+        )
 
     def _build_batch_mcq_prompt(self, passage: str, num_questions: int, options: Optional[Dict[str, Any]] = None) -> str:
         """Build prompt for generating multiple MCQ questions in one API call"""
         language = "en"
-        difficulty = "medium"
-        question_types = [0]  # Default to single choice
-        
+        question_plan = []
+        difficulty_counts: Dict[str, int] = {}
+        type_counts: Dict[str, int] = {}
+
         if options:
             language = options.get("language", "en")
-            difficulty = options.get("difficulty", "medium")
-            question_types = options.get("question_types", [0])
-        
-        # Language instruction mapping
-        lang_instruction = {
-            "vi": "Generate ALL questions, choices, and explanations in Vietnamese (Tiếng Việt).",
-            "en": "Generate ALL questions, choices, and explanations in English.",
-        }.get(language, "Generate ALL questions, choices, and explanations in English.")
-        
-        # Determine question type distribution
-        # 0 = Single choice, 1 = Multiple choice, 2 = Mix mode (explicit)
-        has_single = 0 in question_types
-        has_multiple = 1 in question_types
-        has_mix = 2 in question_types
-        
-        if has_mix or (has_single and has_multiple):  # Mix mode - either explicit or both types requested
-            # Calculate how many of each type
-            single_count = (num_questions + 1) // 2  # Round up for single
-            multiple_count = num_questions - single_count
-            type_instruction = f"""IMPORTANT - Question Type Pattern:
-- Questions 1, 3, 5 (odd numbers): SINGLE correct answer (1 correct choice)
-- Questions 2, 4 (even numbers): MULTIPLE correct answers (exactly 2 correct choices)
-You MUST follow this alternating pattern strictly."""
-            answer_format = '''For ODD questions (single-choice): "answer":"A"
-For EVEN questions (multiple-choice): "answer":["A","B"] (exactly 2 correct answers)'''
-        elif has_multiple:  # Multiple choice only
-            type_instruction = "Each question must have exactly 2 correct answers."
-            answer_format = '"answer":["A","B"]  // Array of 2 correct answer letters'
-        else:  # Single choice only (default)
-            type_instruction = "Each question must have exactly ONE correct answer."
-            answer_format = '"answer":"A"  // Single correct answer letter'
-        
-        # Variety hints for diverse questions
-        variety_aspects = """
-Each question MUST test a DIFFERENT aspect:
-1. Definitions and key concepts
-2. Applications and examples  
-3. Relationships and comparisons
-4. Causes and effects
-5. Processes and procedures
-6. Advantages and disadvantages
-7. Specific details and facts
-"""
-        
-        return f"""You are an expert exam question generator. Generate exactly {num_questions} UNIQUE multiple-choice questions based on the content below.
+            question_plan = options.get("question_plan", [])
+            difficulty_counts = options.get("difficulty_counts", {}) or {}
+            type_counts = options.get("type_counts", {}) or {}
 
-CRITICAL REQUIREMENTS:
-- Generate exactly {num_questions} different questions
-- Each question must test a DIFFERENT concept or aspect
-- NO duplicate or similar questions
-- {type_instruction}
-- Difficulty level: {difficulty}
-{variety_aspects}
+        lang_instruction = LANGUAGE_INSTRUCTIONS_ALL.get(language, LANGUAGE_INSTRUCTIONS_ALL["en"])
 
-{lang_instruction}
+        if question_plan:
+            plan_lines = "\n".join([
+                f"- Q{item.get('index', idx + 1)}: difficulty {item.get('difficulty', 'medium')} | type {item.get('type', 'single_choice')}"
+                for idx, item in enumerate(question_plan)
+            ])
+        else:
+            plan_lines = (
+                "- Distribute questions according to the counts below and keep the order stable.\n"
+                "- If no plan is given, alternate single_choice and multiple_choice while respecting difficulty counts."
+            )
 
-Output ONLY a JSON array with exactly {num_questions} objects, each with these keys:
-[
-  {{"question":"...", "choices":["A)...","B)...","C)...","D)..."], {answer_format}, "explanation":"...", "difficulty":"{difficulty}"}},
-  ...
-]
+        difficulty_summary = (
+            f"- easy: {difficulty_counts.get('easy', 0)}\n"
+            f"- medium: {difficulty_counts.get('medium', 0)}\n"
+            f"- hard: {difficulty_counts.get('hard', 0)}\n"
+            f"- single_choice: {type_counts.get('single', 0)} | multiple_choice: {type_counts.get('multiple', 0)}"
+        )
 
-Content to generate questions from:
-\"\"\"
-{passage}
-\"\"\"
-
-Output JSON array (exactly {num_questions} questions):"""
+        return BATCH_MCQ_PROMPT_TEMPLATE.format(
+            num_questions=num_questions,
+            question_plan_text=plan_lines,
+            difficulty_summary=difficulty_summary,
+            lang_instruction=lang_instruction,
+            passage=passage,
+        )
 
     def _build_distractor_prompt(self, passage: str, correct_answer: str, candidates: List[str]) -> str:
-        candidates_json = [f'"{c}"' for c in candidates[:6]]
-        return f"""Input JSON:
-{{"passage":"{passage}", "correct":"{correct_answer}", "candidates":[{','.join(candidates_json)}]}}
-
-Task: Return exactly three distractors (strings) that are plausible but incorrect given the passage. Do not repeat the correct answer. Ensure distractors are not directly supported by the passage.
-
-Output: JSON array: ["...","...","..."]"""
+        """Build prompt for refining distractor options"""
+        candidates_json = ','.join(f'"{c}"' for c in candidates[:6])
+        return DISTRACTOR_PROMPT_TEMPLATE.format(
+            passage=passage,
+            correct_answer=correct_answer,
+            candidates_json=candidates_json
+        )
 
     def _build_short_answer_prompt(self, passage: str, options: Optional[Dict[str, Any]] = None) -> str:
+        """Build prompt for generating a short answer question"""
         language = "en"
         if options:
             language = options.get("language", "en")
         
-        lang_instruction = {
-            "vi": "Generate the question, answer, and explanation in Vietnamese (Tiếng Việt).",
-            "en": "Generate the question, answer, and explanation in English.",
-        }.get(language, "Generate the question, answer, and explanation in English.")
+        lang_instruction = LANGUAGE_INSTRUCTIONS_SHORT.get(language, LANGUAGE_INSTRUCTIONS_SHORT["en"])
         
-        return f"""Generate a short answer question from the following passage. The question should require a brief text response (1-3 sentences).
-
-{lang_instruction}
-
-Output only JSON: {{"question":"", "answer":"", "explanation":"", "difficulty":"easy|medium|hard"}}
-
-Passage:
-"{passage}"
-
-Output JSON:"""
+        return SHORT_ANSWER_PROMPT_TEMPLATE.format(
+            lang_instruction=lang_instruction,
+            passage=passage
+        )
 
     def _build_true_false_prompt(self, passage: str, options: Optional[Dict[str, Any]] = None) -> str:
+        """Build prompt for generating a true/false question"""
         language = "en"
         if options:
             language = options.get("language", "en")
         
-        lang_instruction = {
-            "vi": "Generate the statement and explanation in Vietnamese (Tiếng Việt).",
-            "en": "Generate the statement and explanation in English.",
-        }.get(language, "Generate the statement and explanation in English.")
+        lang_instruction = LANGUAGE_INSTRUCTIONS_TF.get(language, LANGUAGE_INSTRUCTIONS_TF["en"])
         
-        return f"""Generate a true/false statement based on the following passage. The statement should test understanding of a key fact.
-
-{lang_instruction}
-
-Output only JSON: {{"statement":"", "answer":true|false, "explanation":"", "difficulty":"easy|medium|hard"}}
-
-Passage:
-"{passage}"
-
-Output JSON:"""
+        return TRUE_FALSE_PROMPT_TEMPLATE.format(
+            lang_instruction=lang_instruction,
+            passage=passage
+        )

@@ -1,10 +1,11 @@
 import os
 import tempfile
 import uuid
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 from pathlib import Path
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 
 from loguru import logger
 import numpy as np
@@ -22,7 +23,15 @@ except ImportError:
 
 from app.database.neo4j_db import Neo4jDatabase
 from app.database.faiss_index import FAISSIndex
-from app.models.quiz import QuizQuestion, QuizOption
+from app.models.quiz import (
+    QuizQuestion,
+    QuizOption,
+    DifficultyEnum,
+    QuestionTypeEnum,
+    DifficultyDistribution,
+    QuestionTypeDistribution,
+    PointStrategyEnum,
+)
 from app.parsers import ParserFactory
 from app.chunkers.markdown_chunker import MarkdownChunkerV2
 from app.llm import get_llm_adapter
@@ -70,6 +79,12 @@ def _load_embedding_model(model_name: str, device: str = None):
     return model
 
 
+@dataclass
+class QuestionPlanItem:
+    difficulty: str  # easy | medium | hard
+    question_type: int  # 0 = single, 1 = multiple
+
+
 class QuizGenerationService:
 
     # Thread pool for CPU-bound embedding operations
@@ -87,7 +102,9 @@ class QuizGenerationService:
             min_chunks=3,
             max_chunks=30,
             include_adjacent=True,
-            semantic_weight=0.7
+            semantic_weight=0.7,
+            enable_relevance_detection=True,  # Bật relevance detection
+            relevance_strict_mode=False  # Chế độ thông thường (không quá chặt)
         ))
         
         # Pre-load embedding model (lazy initialization)
@@ -103,6 +120,188 @@ class QuizGenerationService:
                 self._device
             )
         return self._embedding_model
+
+    @staticmethod
+    def _interleave_counts(counts: Dict[str, int], order: List[str]) -> List[str]:
+        """Turn count dict into a balanced sequence preserving declared order priority."""
+        normalized = {key: max(0, int(counts.get(key, 0))) for key in order}
+        sequence: List[str] = []
+        while sum(normalized.values()) > 0:
+            # Always pick the bucket with the most remaining items first (stable on order)
+            for key in sorted(order, key=lambda k: (-normalized[k], order.index(k))):
+                if normalized[key] > 0:
+                    sequence.append(key)
+                    normalized[key] -= 1
+        return sequence
+
+    def _build_question_plan(
+        self,
+        difficulty_counts: Dict[str, int],
+        type_counts: Dict[str, int],
+    ) -> List[QuestionPlanItem]:
+        """Validate inputs and build a per-question blueprint."""
+
+        total_questions = sum(max(0, int(v)) for v in difficulty_counts.values())
+        type_total = sum(max(0, int(v)) for v in type_counts.values())
+
+        if total_questions <= 0:
+            raise ValueError("Tổng số câu hỏi phải lớn hơn 0")
+        if total_questions > self.settings.MAX_NUM_QUESTIONS:
+            raise ValueError(
+                f"Tổng số câu hỏi không được vượt quá {self.settings.MAX_NUM_QUESTIONS}"
+            )
+        if type_total != total_questions:
+            raise ValueError("Tổng số câu hỏi theo loại phải bằng tổng số câu theo độ khó")
+
+        diff_seq = self._interleave_counts(
+            difficulty_counts, [DifficultyEnum.EASY.value, DifficultyEnum.MEDIUM.value, DifficultyEnum.HARD.value]
+        )
+        type_seq = self._interleave_counts(type_counts, ["single", "multiple"])
+
+        if len(diff_seq) != len(type_seq):
+            raise ValueError("Không thể ghép độ khó và loại câu hỏi – kiểm tra lại số lượng nhập vào")
+
+        plan: List[QuestionPlanItem] = []
+        for idx in range(len(diff_seq)):
+            plan.append(
+                QuestionPlanItem(
+                    difficulty=diff_seq[idx],
+                    question_type=0 if type_seq[idx] == "single" else 1,
+                )
+            )
+
+        return plan
+
+    @staticmethod
+    def _serialize_plan(plan: List[QuestionPlanItem]) -> List[Dict[str, Any]]:
+        return [
+            {
+                "index": idx + 1,
+                "difficulty": item.difficulty,
+                "type": "single_choice" if item.question_type == 0 else "multiple_choice",
+            }
+            for idx, item in enumerate(plan)
+        ]
+
+    def _assign_points(
+        self,
+        questions: List[QuizQuestion],
+        plan: List[QuestionPlanItem],
+        total_points: float,
+        strategy: PointStrategyEnum,
+    ) -> None:
+        """Distribute total_points across questions based on strategy."""
+        if not questions:
+            return
+
+        total_questions = len(questions)
+
+        if strategy == PointStrategyEnum.EQUAL or total_questions == 0:
+            base = total_points / total_questions
+            accumulated = 0.0
+            for idx, q in enumerate(questions):
+                if idx == total_questions - 1:
+                    q.point = round(total_points - accumulated, 2)
+                else:
+                    q.point = round(base, 2)
+                    accumulated += q.point
+            return
+
+        # Difficulty-weighted: easy > medium > hard, still sum to total_points
+        weights = {
+            DifficultyEnum.EASY.value: 3,
+            DifficultyEnum.MEDIUM.value: 2,
+            DifficultyEnum.HARD.value: 1,
+        }
+
+        weight_sum = 0
+        item_weights: List[int] = []
+        for idx in range(total_questions):
+            difficulty = plan[idx].difficulty if idx < len(plan) else DifficultyEnum.MEDIUM.value
+            w = weights.get(difficulty, 1)
+            item_weights.append(w)
+            weight_sum += w
+
+        if weight_sum == 0:
+            # Fallback to equal distribution if weights collapse
+            return self._assign_points(questions, plan, total_points, PointStrategyEnum.EQUAL)
+
+        accumulated = 0.0
+        for idx, q in enumerate(questions):
+            raw_point = total_points * item_weights[idx] / weight_sum
+            if idx == total_questions - 1:
+                q.point = round(total_points - accumulated, 2)
+            else:
+                q.point = round(raw_point, 2)
+                accumulated += q.point
+
+    def _build_questions_from_batch_result(
+        self,
+        batch_result: Any,
+        question_plan: List[QuestionPlanItem],
+    ) -> List[QuizQuestion]:
+        """Map LLM batch result into QuizQuestion objects following the blueprint."""
+        questions: List[QuizQuestion] = []
+
+        if not batch_result or not getattr(batch_result, "questions", None):
+            return questions
+
+        answer_map = {"A": 0, "B": 1, "C": 2, "D": 3}
+
+        for idx, result in enumerate(batch_result.questions[: len(question_plan)]):
+            plan_item = question_plan[idx]
+
+            raw_answers = result.answer
+            answers_normalized: List[str]
+            if plan_item.question_type == 1:
+                if isinstance(raw_answers, list):
+                    answers_normalized = [str(a).strip().upper() for a in raw_answers]
+                else:
+                    answers_normalized = [str(raw_answers).strip().upper()]
+            else:
+                if isinstance(raw_answers, list) and raw_answers:
+                    answers_normalized = [str(raw_answers[0]).strip().upper()]
+                else:
+                    answers_normalized = [str(raw_answers).strip().upper()]
+
+            answers_normalized = [a for a in answers_normalized if a]
+            if not answers_normalized:
+                answers_normalized = ["A"]
+
+            correct_indices = [answer_map.get(letter, -1) for letter in answers_normalized]
+            correct_indices = [i for i in correct_indices if i >= 0]
+            if not correct_indices:
+                correct_indices = [0]
+
+            options: List[QuizOption] = []
+            for opt_idx, opt_text in enumerate(result.choices or []):
+                options.append(
+                    QuizOption(
+                        id=0,
+                        optionText=opt_text,
+                        isCorrect=(opt_idx in correct_indices),
+                    )
+                )
+
+            if not options:
+                # Ensure at least 4 options exist to avoid downstream issues
+                options = [
+                    QuizOption(id=0, optionText=f"Option {chr(65 + i)}", isCorrect=(i == 0))
+                    for i in range(4)
+                ]
+
+            questions.append(
+                QuizQuestion(
+                    id=0,
+                    questionText=result.question,
+                    questionType=QuestionTypeEnum(plan_item.question_type),
+                    difficulty=DifficultyEnum(plan_item.difficulty),
+                    point=1.0,
+                    options=options,
+                )
+            )
+
+        return questions
     
     async def _encode_texts_async(self, texts: List[str], batch_size: int = 64, show_progress: bool = False) -> np.ndarray:
         """Encode texts asynchronously using thread pool to avoid blocking event loop."""
@@ -140,78 +339,45 @@ class QuizGenerationService:
     async def generate_from_prompt(
         self,
         prompt: str,
-        num_questions: int,
-        difficulty: str,
+        difficulty_distribution: DifficultyDistribution,
+        question_type_distribution: QuestionTypeDistribution,
         language: str,
-        question_types: List[int],
+        total_points: float,
+        point_strategy: PointStrategyEnum,
     ) -> List[QuizQuestion]:
         
-        logger.info(f"Generating {num_questions} quiz questions from prompt (batch mode)")
+        difficulty_counts = difficulty_distribution.dict()
+        type_counts = question_type_distribution.dict()
+        question_plan = self._build_question_plan(difficulty_counts, type_counts)
 
-        questions = []
-        
+        logger.info(
+            f"Generating {len(question_plan)} quiz questions from prompt with plan: {self._serialize_plan(question_plan)}"
+        )
+
         try:
-            # Generate all questions in a single API call
             options_cfg = {
-                "difficulty": difficulty,
                 "language": language,
-                "question_types": question_types,
+                "question_plan": self._serialize_plan(question_plan),
+                "difficulty_counts": difficulty_counts,
+                "type_counts": type_counts,
             }
             
             batch_result = await self.llm_adapter.generate_batch_mcq(
-                prompt, num_questions, options=options_cfg
+                prompt,
+                len(question_plan),
+                options=options_cfg,
             )
-            
-            if batch_result and batch_result.questions:
-                from app.models.quiz import QuestionTypeEnum
-                
-                # Determine question type distribution
-                if 2 in question_types:  # Mix mode
-                    actual_types = [0, 1]  # Single and Multiple choice
-                else:
-                    actual_types = question_types
-                
-                for idx, result in enumerate(batch_result.questions[:num_questions]):
-                    if not result.question or not result.choices:
-                        continue
-                    
-                    # Alternate question types based on answer format
-                    if isinstance(result.answer, list) and len(result.answer) > 1:
-                        q_type = 1  # Multiple choice
-                    else:
-                        q_type = 0  # Single choice
-                    
-                    # Map answer letter(s) to index
-                    answer_map = {"A": 0, "B": 1, "C": 2, "D": 3}
-                    
-                    if isinstance(result.answer, list):
-                        correct_indices = [answer_map.get(a.strip().upper(), -1) for a in result.answer]
-                        correct_indices = [i for i in correct_indices if i >= 0]
-                    else:
-                        correct_indices = [answer_map.get(str(result.answer).strip().upper(), 0)]
 
-                    # Build options list - ID always defaults to 0
-                    options = []
-                    for opt_idx, opt_text in enumerate(result.choices):
-                        options.append(
-                            QuizOption(
-                                id=0,
-                                optionText=opt_text,
-                                isCorrect=(opt_idx in correct_indices),
-                            )
-                        )
+            questions = self._build_questions_from_batch_result(
+                batch_result=batch_result,
+                question_plan=question_plan,
+            )
+            self._assign_points(questions, question_plan, total_points, point_strategy)
+            logger.info(
+                f"Successfully generated {len(questions)}/{len(question_plan)} questions in single API call"
+            )
+            return questions
 
-                    question = QuizQuestion(
-                        id=0,
-                        questionText=result.question,
-                        questionType=QuestionTypeEnum(q_type),
-                        point=1.0,
-                        options=options,
-                    )
-                    questions.append(question)
-                
-                logger.info(f"Successfully generated {len(questions)}/{num_questions} questions in single API call")
-                    
         except Exception as e:
             logger.error(f"Error generating questions from prompt: {e}")
             raise
@@ -219,21 +385,26 @@ class QuizGenerationService:
             # Always cleanup database and FAISS index after generation (success or failure)
             self.cleanup_data()
 
-        return questions
-
     async def generate_from_file_advanced(
         self,
         file_path: str,
-        num_questions: int,
-        difficulty: str,
+        difficulty_distribution: DifficultyDistribution,
+        question_type_distribution: QuestionTypeDistribution,
         language: str,
-        question_types: List[int],
+        total_points: float,
+        point_strategy: PointStrategyEnum,
         additional_prompt: Optional[str] = None,
     ) -> tuple[List[QuizQuestion], str, str, List[str], List[Dict[str, Any]]]:
         
         logger.info(f"🚀 Starting advanced quiz generation for: {file_path}")
         document_id = str(uuid.uuid4())
         metadata = {"steps": []}
+
+        question_plan = self._build_question_plan(
+            difficulty_counts=difficulty_distribution.dict(),
+            type_counts=question_type_distribution.dict(),
+        )
+        num_questions = len(question_plan)
 
         try:
             # Step 1: Parse document to Markdown using LlamaParse
@@ -348,7 +519,7 @@ class QuizGenerationService:
 
             # Step 5: Candidate selection (uses hybrid search if additional_prompt provided)
             logger.info("🎯 Step 5: Selecting candidate chunks...")
-            candidate_chunks = await self._select_candidate_chunks(
+            candidate_chunks, relevance_metadata = await self._select_candidate_chunks(
                 chunks=chunks,
                 chunk_ids=chunk_ids,
                 embeddings=embeddings,
@@ -358,29 +529,36 @@ class QuizGenerationService:
             )
             
             logger.info(f"✓ Selected {len(candidate_chunks)} candidate chunks")
-            metadata["steps"].append({
+            step5_info = {
                 "step": 5,
                 "name": "candidate_selection",
                 "status": "success",
                 "num_candidates": len(candidate_chunks)
-            })
+            }
+            
+            # Thêm relevance info nếu có
+            if relevance_metadata:
+                step5_info.update(relevance_metadata)
+            
+            metadata["steps"].append(step5_info)
 
             # Step 6: Generate questions with LLM (single batch call)
             logger.info("🤖 Step 6: Generating questions with LLM (batch mode)...")
             questions, question_chunk_ids = await self._generate_questions_batch(
                 candidate_chunks=candidate_chunks,
-                num_questions=num_questions,
-                difficulty=difficulty,
+                question_plan=question_plan,
                 language=language,
-                question_types=question_types,
             )
-            
+            self._assign_points(questions, question_plan, total_points, point_strategy)
+
             logger.info(f"✓ Generated {len(questions)} questions in single API call")
             metadata["steps"].append({
                 "step": 6,
                 "name": "question_generation",
                 "status": "success",
-                "num_questions": len(questions)
+                "num_questions": len(questions),
+                "point_strategy": point_strategy.value,
+                "total_points": total_points,
             })
 
             # Step 7: Store questions in Neo4j
@@ -403,7 +581,7 @@ class QuizGenerationService:
                     choices=choices,
                     answer=answer_letter,
                     explanation="",
-                    difficulty=difficulty,
+                    difficulty=question.difficulty.value,
                     confidence=0.7,
                     metadata_json=_json.dumps({"language": language}, ensure_ascii=False)
                 )
@@ -443,20 +621,32 @@ class QuizGenerationService:
         embeddings: np.ndarray,
         num_questions: int,
         document_id: str = None,
-        additional_prompt: str = None
-    ) -> List[Dict[str, Any]]:
+        additional_prompt: str = None,
+        document_overview: str = None
+    ) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]:
+        """
+        Select candidate chunks with optional relevance detection.
         
+        Returns:
+            Tuple of (candidate_chunks, relevance_metadata)
+        """
         # Calculate how many chunks we need
         num_chunks = self.chunk_selector.calculate_chunks_needed(num_questions)
         
+        relevance_metadata = None
+        
         # Select based on mode
         if additional_prompt and len(additional_prompt.strip()) > 0:
-            # Mode: Search-based selection with hybrid search
+            # Mode: Search-based selection with hybrid search + relevance detection
             logger.info(f"🔍 Using search-based selection with prompt: '{additional_prompt[:50]}...'")
             
-            # Use cached embedding model instead of loading again
+            # Generate document overview for relevance detection (first 3 chunks)
+            if not document_overview and len(chunks) > 0:
+                overview_texts = [c.text for c in chunks[:3]]
+                document_overview = "\n".join(overview_texts)[:1000]
             
-            candidates = self.chunk_selector.select_by_search(
+            # Use cached embedding model instead of loading again
+            candidates, relevance_result = self.chunk_selector.select_by_search(
                 query=additional_prompt,
                 chunks=chunks,
                 chunk_ids=chunk_ids,
@@ -464,8 +654,26 @@ class QuizGenerationService:
                 faiss_index=self.faiss_index,
                 embedding_model=self.embedding_model,
                 num_chunks=num_chunks,
-                document_id=document_id
+                document_id=document_id,
+                document_overview=document_overview
             )
+            
+            # Build relevance metadata để trả về cho caller
+            if relevance_result:
+                relevance_metadata = {
+                    "query_relevance": {
+                        "is_relevant": relevance_result.is_relevant,
+                        "relevance_score": relevance_result.relevance_score,
+                        "confidence": relevance_result.confidence,
+                        "strategy_used": relevance_result.strategy,
+                        "warning_message": relevance_result.warning_message,
+                        "details": relevance_result.details
+                    }
+                }
+                
+                # Log warning nếu có
+                if relevance_result.warning_message:
+                    logger.warning(f"⚠️ {relevance_result.warning_message}")
         else:
             # Mode: Representative selection for comprehensive coverage
             logger.info("📊 Using representative selection for document coverage")
@@ -496,88 +704,60 @@ class QuizGenerationService:
         logger.info(f"✓ Selected {len(candidates)} chunks ({total_tokens} tokens)")
         logger.info(f"  Selection breakdown: {methods}")
         
-        return candidates
+        return candidates, relevance_metadata
 
     async def _generate_questions_batch(
         self,
         candidate_chunks: List[Dict[str, Any]],
-        num_questions: int,
-        difficulty: str,
+        question_plan: List[QuestionPlanItem],
         language: str,
-        question_types: List[int],
     ) -> tuple[List[QuizQuestion], List[str]]:
         """Generate all questions in a single LLM API call using batch mode."""
-        
-        from app.models.quiz import QuizOption, QuestionTypeEnum
-        
+
         questions: List[QuizQuestion] = []
         question_chunk_ids: List[str] = []
-        
-        # Combine candidate chunks into a single content block
+        num_questions = len(question_plan)
+
         combined_content = "\n\n---\n\n".join([
             f"[Section {idx+1}]\n{chunk['text']}" 
             for idx, chunk in enumerate(candidate_chunks[:num_questions])
         ])
-        
-        # Build options for batch generation
+
+        # Summaries for prompt clarity
+        difficulty_counts: Dict[str, int] = {"easy": 0, "medium": 0, "hard": 0}
+        type_counts: Dict[str, int] = {"single": 0, "multiple": 0}
+        for item in question_plan:
+            difficulty_counts[item.difficulty] = difficulty_counts.get(item.difficulty, 0) + 1
+            if item.question_type == 0:
+                type_counts["single"] += 1
+            else:
+                type_counts["multiple"] += 1
+
         options_cfg = {
-            "difficulty": difficulty,
             "language": language,
-            "question_types": question_types,
+            "question_plan": self._serialize_plan(question_plan),
+            "difficulty_counts": difficulty_counts,
+            "type_counts": type_counts,
         }
-        
+
         try:
-            # Single API call to generate all questions
             batch_result = await self.llm_adapter.generate_batch_mcq(
-                combined_content, num_questions, options=options_cfg
+                combined_content,
+                num_questions,
+                options=options_cfg,
             )
-            
-            if batch_result and batch_result.questions:
-                for idx, result in enumerate(batch_result.questions[:num_questions]):
-                    if not result.question or not result.choices:
-                        continue
-                    
-                    # Determine question type based on answer format
-                    if isinstance(result.answer, list) and len(result.answer) > 1:
-                        q_type = 1  # Multiple choice
-                    else:
-                        q_type = 0  # Single choice
-                    
-                    # Map answer letter(s) to index
-                    answer_map = {"A": 0, "B": 1, "C": 2, "D": 3}
-                    
-                    if isinstance(result.answer, list):
-                        correct_indices = [answer_map.get(a.strip().upper(), -1) for a in result.answer]
-                        correct_indices = [i for i in correct_indices if i >= 0]
-                    else:
-                        correct_indices = [answer_map.get(str(result.answer).strip().upper(), 0)]
 
-                    # Build options list - ID always defaults to 0
-                    options = []
-                    for opt_idx, opt_text in enumerate(result.choices):
-                        options.append(
-                            QuizOption(
-                                id=0,
-                                optionText=opt_text,
-                                isCorrect=(opt_idx in correct_indices),
-                            )
-                        )
+            questions = self._build_questions_from_batch_result(
+                batch_result=batch_result,
+                question_plan=question_plan,
+            )
 
-                    question = QuizQuestion(
-                        id=0,
-                        questionText=result.question,
-                        questionType=QuestionTypeEnum(q_type),
-                        point=1.0,
-                        options=options,
-                    )
-                    questions.append(question)
-                    
-                    # Map to corresponding chunk ID
-                    chunk_idx = min(idx, len(candidate_chunks) - 1)
-                    question_chunk_ids.append(candidate_chunks[chunk_idx].get("chunk_id", ""))
-                
-                logger.info(f"Generated {len(questions)} questions in single batch API call")
-                    
+            for idx in range(len(questions)):
+                chunk_idx = min(idx, len(candidate_chunks) - 1)
+                question_chunk_ids.append(candidate_chunks[chunk_idx].get("chunk_id", ""))
+
+            logger.info(f"Generated {len(questions)} questions in single batch API call")
+
         except Exception as e:
             logger.error(f"Error in batch question generation: {e}")
             raise

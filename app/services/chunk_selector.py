@@ -5,6 +5,8 @@ from typing import List, Dict, Any, Optional, Tuple
 from dataclasses import dataclass
 from loguru import logger
 
+from app.services.relevance_detector import QueryRelevanceDetector, RelevanceResult
+
 
 @dataclass
 class ChunkSelectionConfig:
@@ -14,12 +16,25 @@ class ChunkSelectionConfig:
     max_chunks: int = 30
     include_adjacent: bool = True  # Include chunks before/after search results
     semantic_weight: float = 0.7  # Weight for semantic vs BM25 in hybrid search
+    enable_relevance_detection: bool = True  # Bật/tắt phát hiện độ liên quan
+    relevance_strict_mode: bool = False  # Chế độ chặt chẽ cho relevance detection
 
 
 class ChunkSelector:
     
     def __init__(self, config: ChunkSelectionConfig = None):
         self.config = config or ChunkSelectionConfig()
+        
+        # Initialize relevance detector nếu được bật
+        if self.config.enable_relevance_detection:
+            self.relevance_detector = QueryRelevanceDetector(
+                high_relevance_threshold=0.75 if self.config.relevance_strict_mode else 0.65,
+                low_relevance_threshold=0.45 if self.config.relevance_strict_mode else 0.35,
+                min_top_score=0.5 if self.config.relevance_strict_mode else 0.4,
+                max_score_variance=0.12 if self.config.relevance_strict_mode else 0.15
+            )
+        else:
+            self.relevance_detector = None
     
     def calculate_chunks_needed(self, num_questions: int) -> int:
         
@@ -55,9 +70,17 @@ class ChunkSelector:
         faiss_index,
         embedding_model,
         num_chunks: int,
-        document_id: str = None
-    ) -> List[Dict[str, Any]]:
+        document_id: str = None,
+        document_overview: str = None
+    ) -> Tuple[List[Dict[str, Any]], Optional[RelevanceResult]]:
+        """
+        Chọn chunks dựa trên search query với relevance detection.
         
+        Returns:
+            Tuple of (selected_chunks, relevance_result)
+            - selected_chunks: Danh sách chunks được chọn
+            - relevance_result: Kết quả phân tích độ liên quan (hoặc None nếu tắt)
+        """
         logger.info(f"Selecting {num_chunks} chunks by search for query: '{query[:50]}...'")
         
         # Run hybrid search
@@ -70,6 +93,121 @@ class ChunkSelector:
             use_bm25=True
         )
         
+        # === Phân tích độ liên quan ===
+        relevance_result = None
+        actual_strategy = "search"  # Default strategy
+        
+        if self.relevance_detector and search_results:
+            # Encode query để phân tích
+            query_embedding = embedding_model.encode([query], convert_to_numpy=True)[0]
+            
+            # Phân tích độ liên quan
+            relevance_result = self.relevance_detector.analyze_query_relevance(
+                query=query,
+                query_embedding=query_embedding,
+                search_results=search_results,
+                document_overview=document_overview,
+                chunks=chunks,
+                embeddings=embeddings,
+                embedding_model=embedding_model
+            )
+            
+            actual_strategy = relevance_result.strategy
+            
+            # Log cảnh báo nếu có
+            if relevance_result.warning_message:
+                logger.warning(f"⚠️ Relevance Warning: {relevance_result.warning_message}")
+            
+            logger.info(
+                f"📊 Relevance Analysis: score={relevance_result.relevance_score:.3f}, "
+                f"strategy={actual_strategy}, confidence={relevance_result.confidence:.3f}"
+            )
+        
+        # === Xử lý theo strategy ===
+        if actual_strategy == "representative":
+            # Query không liên quan -> chuyển sang representative mode
+            logger.warning(
+                "🔄 Switching to REPRESENTATIVE mode due to low query relevance"
+            )
+            selected = self.select_representative(
+                chunks=chunks,
+                chunk_ids=chunk_ids,
+                embeddings=embeddings,
+                num_chunks=num_chunks
+            )
+            
+            # Đánh dấu selection method
+            for chunk in selected:
+                chunk["selection_method"] = "representative_fallback"
+                chunk["original_strategy"] = "search"
+                chunk["fallback_reason"] = "low_query_relevance"
+            
+            return selected, relevance_result
+        
+        elif actual_strategy == "hybrid":
+            # Medium relevance -> kết hợp search và representative
+            logger.info("🔀 Using HYBRID strategy (search + representative)")
+            
+            # Lấy 60% từ search, 40% từ representative
+            search_count = int(num_chunks * 0.6)
+            repr_count = num_chunks - search_count
+            
+            # Get search-based chunks
+            search_chunks = self._select_from_search_results(
+                search_results=search_results,
+                chunks=chunks,
+                chunk_ids=chunk_ids,
+                num_select=search_count,
+                document_id=document_id
+            )
+            
+            # Get representative chunks (excluding already selected)
+            selected_ids = {c["chunk_id"] for c in search_chunks}
+            repr_chunks = self._select_representative_excluding(
+                chunks=chunks,
+                chunk_ids=chunk_ids,
+                embeddings=embeddings,
+                num_chunks=repr_count,
+                exclude_ids=selected_ids
+            )
+            
+            # Combine
+            selected = search_chunks + repr_chunks
+            
+            # Sort by chunk_index for reading order
+            selected.sort(key=lambda x: x["chunk_index"])
+            
+            return selected, relevance_result
+        
+        else:
+            # High relevance -> normal search-based selection
+            selected = self._select_from_search_results(
+                search_results=search_results,
+                chunks=chunks,
+                chunk_ids=chunk_ids,
+                num_select=num_chunks,
+                document_id=document_id
+            )
+            
+            # Expand with adjacent chunks if enabled and have room
+            if self.config.include_adjacent and len(selected) < num_chunks:
+                selected_ids = {s["chunk_id"] for s in selected}
+                total_tokens = sum(s["token_count"] for s in selected)
+                selected = self._expand_with_adjacent(
+                    selected, chunks, chunk_ids, selected_ids, total_tokens
+                )
+            
+            return selected, relevance_result
+    
+    def _select_from_search_results(
+        self,
+        search_results: List[Tuple[str, float, Dict]],
+        chunks: List[Any],
+        chunk_ids: List[str],
+        num_select: int,
+        document_id: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        """Helper method để select chunks từ search results."""
         # Build chunk index map
         chunk_map = {cid: (idx, chunk) for idx, (cid, chunk) in enumerate(zip(chunk_ids, chunks))}
         
@@ -106,17 +244,41 @@ class ChunkSelector:
             selected_ids.add(chunk_id)
             total_tokens += token_count
             
-            if len(selected) >= num_chunks:
+            if len(selected) >= num_select:
                 break
         
-        # Expand with adjacent chunks if enabled and have room
-        if self.config.include_adjacent and len(selected) < num_chunks:
-            selected = self._expand_with_adjacent(
-                selected, chunks, chunk_ids, selected_ids, total_tokens
-            )
-        
-        logger.info(f"Selected {len(selected)} chunks ({total_tokens} tokens) by search")
+        logger.info(f"Selected {len(selected)} chunks ({total_tokens} tokens) from search")
         return selected
+    
+    def _select_representative_excluding(
+        self,
+        chunks: List[Any],
+        chunk_ids: List[str],
+        embeddings: np.ndarray,
+        num_chunks: int,
+        exclude_ids: set
+    ) -> List[Dict[str, Any]]:
+        """Select representative chunks excluding already selected IDs."""
+        # Filter out excluded chunks
+        filtered_indices = [
+            i for i, cid in enumerate(chunk_ids)
+            if cid not in exclude_ids
+        ]
+        
+        if not filtered_indices:
+            return []
+        
+        filtered_chunks = [chunks[i] for i in filtered_indices]
+        filtered_ids = [chunk_ids[i] for i in filtered_indices]
+        filtered_embeddings = embeddings[filtered_indices]
+        
+        # Select representative from filtered set
+        return self.select_representative(
+            chunks=filtered_chunks,
+            chunk_ids=filtered_ids,
+            embeddings=filtered_embeddings,
+            num_chunks=num_chunks
+        )
     
     def select_representative(
         self,
