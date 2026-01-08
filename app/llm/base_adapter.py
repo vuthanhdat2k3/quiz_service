@@ -74,142 +74,142 @@ class LLMAdapter(ABC):
     def _repair_json(self, text: str) -> str:
         """
         Attempt to repair common JSON issues from LLM output.
-        Handles: unterminated strings, missing brackets, trailing commas.
+        Handles: unterminated strings, missing brackets, trailing commas, truncated responses.
+        
+        Strategy: Extract complete JSON objects and build a valid array from them.
         """
         original_text = text
         
-        # Step 1: Try to find the start of JSON array or object
+        # Step 1: Find the start of JSON (array or object)
         json_start = -1
+        is_array = False
         for i, char in enumerate(text):
-            if char in '[{':
+            if char == '[':
                 json_start = i
+                is_array = True
+                break
+            elif char == '{':
+                json_start = i
+                is_array = False
                 break
         
         if json_start == -1:
+            logger.warning("No JSON structure found in text")
             return text
         
         text = text[json_start:]
         
-        # Step 2: Count brackets to find where JSON should end
-        bracket_stack = []
-        in_string = False
-        escape_next = False
-        last_valid_pos = 0
+        # Step 2: Try to parse as-is first (may already be valid)
+        try:
+            json.loads(text)
+            return text  # Already valid JSON
+        except json.JSONDecodeError:
+            pass  # Continue with repair
         
-        for i, char in enumerate(text):
-            if escape_next:
-                escape_next = False
-                continue
-            
-            if char == '\\' and in_string:
-                escape_next = True
-                continue
-            
-            if char == '"' and not escape_next:
-                in_string = not in_string
-                last_valid_pos = i
-                continue
-            
-            if not in_string:
-                if char in '[{':
-                    bracket_stack.append(char)
-                    last_valid_pos = i
-                elif char == ']':
-                    if bracket_stack and bracket_stack[-1] == '[':
-                        bracket_stack.pop()
-                        last_valid_pos = i
-                elif char == '}':
-                    if bracket_stack and bracket_stack[-1] == '{':
-                        bracket_stack.pop()
-                        last_valid_pos = i
-                elif char not in ' \t\n\r':
-                    last_valid_pos = i
+        # Step 3: Extract complete JSON objects from the text
+        complete_objects = self._extract_complete_objects(text)
         
-        # Step 3: If we're still inside a string (unterminated), find last complete object
-        if in_string or bracket_stack:
-            # Strategy: Find the last complete question object by looking for "},"
-            # which indicates a complete object in an array
+        if not complete_objects:
+            logger.warning("Could not extract any complete JSON objects")
+            return text
+        
+        logger.info(f"Extracted {len(complete_objects)} complete objects from truncated response")
+        
+        # Step 4: Rebuild as JSON array
+        if is_array or len(complete_objects) > 1:
+            repaired = "[\n" + ",\n".join(complete_objects) + "\n]"
+        else:
+            repaired = complete_objects[0]
+        
+        logger.debug(f"JSON repair: original length={len(original_text)}, repaired length={len(repaired)}")
+        
+        return repaired
+    
+    def _extract_complete_objects(self, text: str) -> List[str]:
+        """
+        Extract complete JSON objects from potentially truncated text.
+        Uses character-by-character parsing to track bracket depth and string state.
+        """
+        complete_objects = []
+        
+        i = 0
+        while i < len(text):
+            # Find start of next object
+            while i < len(text) and text[i] != '{':
+                i += 1
             
-            # Find all positions of complete objects (ending with },)
-            complete_obj_positions = []
-            search_pos = 0
-            while True:
-                pos = text.find('},', search_pos)
-                if pos == -1:
-                    break
-                complete_obj_positions.append(pos + 1)  # Include the }
-                search_pos = pos + 1
+            if i >= len(text):
+                break
             
-            # Also check for complete object at end (just })
-            # But we need to verify the bracket count
-            if complete_obj_positions:
-                # Truncate to the last complete object
-                truncate_pos = complete_obj_positions[-1]
-                text = text[:truncate_pos + 1]  # Include the closing }
+            # Parse the object
+            obj_start = i
+            depth = 0
+            in_string = False
+            escape_next = False
+            obj_complete = False
+            
+            while i < len(text):
+                char = text[i]
                 
-                # Recalculate bracket stack
-                bracket_stack = []
-                in_string = False
-                escape_next = False
-                for char in text:
-                    if escape_next:
-                        escape_next = False
-                        continue
-                    if char == '\\' and in_string:
-                        escape_next = True
-                        continue
-                    if char == '"' and not escape_next:
-                        in_string = not in_string
-                        continue
-                    if not in_string:
-                        if char == '[':
-                            bracket_stack.append('[')
-                        elif char == '{':
-                            bracket_stack.append('{')
-                        elif char == ']' and bracket_stack and bracket_stack[-1] == '[':
-                            bracket_stack.pop()
-                        elif char == '}' and bracket_stack and bracket_stack[-1] == '{':
-                            bracket_stack.pop()
-            else:
-                # No complete objects found, try original truncation logic
-                last_quote = text.rfind('"', 0, len(text) - 1)
-                if last_quote > 0:
-                    truncate_pos = last_quote
-                    for j in range(last_quote - 1, -1, -1):
-                        if text[j] == ',':
-                            truncate_pos = j
+                if escape_next:
+                    escape_next = False
+                    i += 1
+                    continue
+                
+                if char == '\\' and in_string:
+                    escape_next = True
+                    i += 1
+                    continue
+                
+                if char == '"' and not escape_next:
+                    in_string = not in_string
+                    i += 1
+                    continue
+                
+                if not in_string:
+                    if char == '{':
+                        depth += 1
+                    elif char == '}':
+                        depth -= 1
+                        if depth == 0:
+                            # Found complete object
+                            obj_text = text[obj_start:i+1]
+                            # Validate it's parseable
+                            try:
+                                json.loads(obj_text)
+                                complete_objects.append(obj_text)
+                                obj_complete = True
+                            except json.JSONDecodeError:
+                                # Try to fix common issues within the object
+                                fixed_obj = self._fix_object_issues(obj_text)
+                                if fixed_obj:
+                                    complete_objects.append(fixed_obj)
+                                    obj_complete = True
+                            i += 1
                             break
-                        elif text[j] in '[{':
-                            truncate_pos = j + 1
-                            break
-                    
-                    text = text[:truncate_pos].rstrip(',').rstrip()
-                    # Recalculate bracket stack
-                    bracket_stack = []
-                    for char in text:
-                        if char == '[':
-                            bracket_stack.append('[')
-                        elif char == '{':
-                            bracket_stack.append('{')
-                        elif char == ']' and bracket_stack and bracket_stack[-1] == '[':
-                            bracket_stack.pop()
-                        elif char == '}' and bracket_stack and bracket_stack[-1] == '{':
-                            bracket_stack.pop()
+                
+                i += 1
+            
+            # If we didn't complete an object, we've hit the truncation point
+            if not obj_complete:
+                break
         
-        # Step 4: Remove trailing commas before closing brackets
-        text = re.sub(r',\s*([\]}])', r'\1', text)
+        return complete_objects
+    
+    def _fix_object_issues(self, obj_text: str) -> Optional[str]:
+        """
+        Try to fix common issues within a JSON object that looks complete structurally
+        but has minor issues like trailing commas.
+        """
+        # Remove trailing commas before closing braces/brackets
+        fixed = re.sub(r',\s*}', '}', obj_text)
+        fixed = re.sub(r',\s*]', ']', fixed)
         
-        # Step 5: Close any unclosed brackets
-        while bracket_stack:
-            bracket = bracket_stack.pop()
-            if bracket == '[':
-                text += ']'
-            elif bracket == '{':
-                text += '}'
-        
-        logger.debug(f"JSON repair: original length={len(original_text)}, repaired length={len(text)}")
-        
-        return text
+        try:
+            json.loads(fixed)
+            return fixed
+        except json.JSONDecodeError:
+            return None
 
     def _validate_and_filter_questions(self, data: Any) -> Dict[str, Any]:
         """

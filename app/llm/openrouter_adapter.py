@@ -31,6 +31,7 @@ class OpenRouterAdapter(LLMAdapter):
         self,
         api_key: Optional[str] = None,
         model_name: str = OPENROUTER_MODEL,
+        max_output_tokens: int = 4096,
         **kwargs
     ):
         super().__init__(model_name=model_name, **kwargs)
@@ -42,11 +43,12 @@ class OpenRouterAdapter(LLMAdapter):
         if not api_key:
             raise ValueError("OPENROUTER_API_KEY is required")
 
+        self.max_output_tokens = max_output_tokens
         self.client = AsyncOpenAI(
             api_key=api_key,
             base_url=OPENROUTER_BASE_URL,
         )
-        logger.info(f"Initialized OpenRouterAdapter with model {model_name}")
+        logger.info(f"Initialized OpenRouterAdapter with model {model_name}, max_output_tokens={max_output_tokens}")
 
     def _extract_json_from_response(self, text: str) -> str:
         text = text.strip()
@@ -63,26 +65,49 @@ class OpenRouterAdapter(LLMAdapter):
         
         return text
 
-    async def _call_with_retry(self, prompt: str) -> str:
+    async def _call_with_retry(self, prompt: str, max_tokens: Optional[int] = None) -> str:
+        """Call OpenRouter API with retry logic and rate limit handling."""
+        import random
+        
+        effective_max_tokens = max_tokens or self.max_output_tokens
+        
         for attempt in range(self.max_retries):
             try:
                 response = await self.client.chat.completions.create(
                     model=self.model_name,
                     messages=[
-                        {"role": "system", "content": "You are an expert exam question generator. Always respond with valid JSON only, no markdown formatting."},
+                        {"role": "system", "content": "You are an expert exam question generator. Always respond with valid, complete JSON only. No markdown formatting. Ensure all JSON objects are properly closed."},
                         {"role": "user", "content": prompt},
                     ],
                     temperature=self.temperature,
+                    max_tokens=effective_max_tokens,
                     extra_headers={
                         "HTTP-Referer": "https://ptit-ocm.edu.vn",
                         "X-Title": "PTIT Quiz Service",
                     },
                 )
                 raw_content = response.choices[0].message.content
+                
+                # Check if response was truncated (finish_reason)
+                finish_reason = response.choices[0].finish_reason
+                if finish_reason == "length":
+                    logger.warning(f"Response was truncated (finish_reason=length). Consider increasing max_tokens.")
+                
                 return self._extract_json_from_response(raw_content)
             except Exception as e:
-                wait_time = 0.5 * (2**attempt)
-                logger.warning(f"OpenRouter API call failed (attempt {attempt + 1}/{self.max_retries}): {e}")
+                error_str = str(e)
+                
+                # Check for rate limit error (429)
+                if "429" in error_str or "rate" in error_str.lower():
+                    # Longer wait for rate limits with jitter
+                    base_wait = 5.0 * (2 ** attempt)  # 5s, 10s, 20s
+                    jitter = random.uniform(0, 2)
+                    wait_time = min(base_wait + jitter, 60)  # Cap at 60 seconds
+                    logger.warning(f"Rate limit hit (attempt {attempt + 1}/{self.max_retries}). Waiting {wait_time:.1f}s...")
+                else:
+                    wait_time = 0.5 * (2 ** attempt)
+                    logger.warning(f"OpenRouter API call failed (attempt {attempt + 1}/{self.max_retries}): {e}")
+                
                 if attempt < self.max_retries - 1:
                     await asyncio.sleep(wait_time)
                 else:
