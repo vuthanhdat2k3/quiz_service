@@ -13,6 +13,7 @@ from app.models.quiz import (
     QuestionTypeDistribution,
     PointStrategyEnum,
     QuizMetadata,
+    QueryRelevanceInfo,
 )
 from app.services.quiz_service import QuizGenerationService
 from app.utils.file_utils import cleanup_temp_file, validate_file_extension
@@ -188,7 +189,7 @@ async def generate_from_file(
         temp_file_path = await service.save_uploaded_file(file_content, file.filename)
 
         # Generate questions from file using full pipeline
-        questions, file_name, parsed_text, chunks, pipeline_metadata = await service.generate_from_file_advanced(
+        questions, file_name, parsed_text, chunks, pipeline_metadata, relevance_metadata = await service.generate_from_file_advanced(
             file_path=temp_file_path,
             difficulty_distribution=difficulty_obj,
             question_type_distribution=type_obj,
@@ -198,6 +199,23 @@ async def generate_from_file(
             additional_prompt=prompt,
         )
         logger.info(f"Pipeline metadata: {pipeline_metadata}")
+        
+        # Build query relevance info if available
+        query_relevance_info = None
+        if relevance_metadata and "query_relevance" in relevance_metadata:
+            qr = relevance_metadata["query_relevance"]
+            query_relevance_info = QueryRelevanceInfo(
+                is_relevant=qr.get("is_relevant", True),
+                relevance_score=qr.get("relevance_score", 1.0),
+                confidence=qr.get("confidence", 1.0),
+                strategy_used=qr.get("strategy_used", "search"),
+                warning_message=qr.get("warning_message"),
+                details=qr.get("details")
+            )
+            
+            # Log warning if present
+            if qr.get("warning_message"):
+                logger.warning(f"Query relevance warning: {qr.get('warning_message')}")
 
         # Build metadata
         metadata = QuizMetadata(
@@ -219,6 +237,7 @@ async def generate_from_file(
             metadata=metadata,
             parsed_text=parsed_text,
             chunks=chunks,
+            query_relevance=query_relevance_info,
         )
 
         logger.info(f"Successfully generated {len(questions)} questions from file: {file_name}")

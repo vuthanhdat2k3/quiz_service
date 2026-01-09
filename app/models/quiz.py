@@ -1,5 +1,5 @@
 from enum import Enum
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 
 from pydantic import BaseModel, Field
 
@@ -101,6 +101,16 @@ class QuizMetadata(BaseModel):
     file_name: Optional[str] = None
 
 
+class QueryRelevanceInfo(BaseModel):
+    """Thông tin về độ liên quan của query với document."""
+    is_relevant: bool = Field(..., description="Query có liên quan đến document không")
+    relevance_score: float = Field(..., ge=0, le=1, description="Điểm liên quan (0-1)")
+    confidence: float = Field(..., ge=0, le=1, description="Độ tin cậy của đánh giá (0-1)")
+    strategy_used: str = Field(..., description="Chiến lược được sử dụng: 'search', 'hybrid', hoặc 'representative'")
+    warning_message: Optional[str] = Field(None, description="Cảnh báo cho người dùng (nếu query không/ít liên quan)")
+    details: Optional[Dict[str, Any]] = Field(None, description="Chi tiết phân tích (scores, thresholds, etc.)")
+
+
 class GenerateFromPromptResponse(BaseModel):
     success: bool = Field(..., description="Whether generation was successful")
     message: str = Field(..., description="Status message")
@@ -119,6 +129,10 @@ class GenerateFromFileResponse(BaseModel):
     metadata: QuizMetadata = Field(..., description="Generation metadata")
     parsed_text: Optional[str] = Field(None, description="Original parsed text from file")
     chunks: Optional[List[str]] = Field(None, description="Text chunks used for generation")
+    query_relevance: Optional[QueryRelevanceInfo] = Field(
+        None, 
+        description="Thông tin về độ liên quan của prompt/query với document. Chứa cảnh báo nếu query không phù hợp."
+    )
 
 
 class ErrorResponse(BaseModel):

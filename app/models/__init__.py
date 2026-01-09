@@ -12,6 +12,7 @@ from .quiz import (
     QuizMetadata,
     QuizOption,
     QuizQuestion,
+    QueryRelevanceInfo,
 )
 
 __all__ = [
@@ -28,4 +29,5 @@ __all__ = [
     "GenerateFromPromptResponse",
     "GenerateFromFileResponse",
     "ErrorResponse",
+    "QueryRelevanceInfo",
 ]

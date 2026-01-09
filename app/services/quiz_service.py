@@ -394,7 +394,7 @@ class QuizGenerationService:
         total_points: float,
         point_strategy: PointStrategyEnum,
         additional_prompt: Optional[str] = None,
-    ) -> tuple[List[QuizQuestion], str, str, List[str], List[Dict[str, Any]]]:
+    ) -> tuple[List[QuizQuestion], str, str, List[str], List[Dict[str, Any]], Optional[Dict[str, Any]]]:
         
         logger.info(f"🚀 Starting advanced quiz generation for: {file_path}")
         document_id = str(uuid.uuid4())
@@ -596,7 +596,7 @@ class QuizGenerationService:
 
             # Return results
             chunk_texts_list = [c.text for c in chunks]
-            return questions, file_name, markdown_content, chunk_texts_list, metadata
+            return questions, file_name, markdown_content, chunk_texts_list, metadata, relevance_metadata
 
         except Exception as e:
             import traceback
