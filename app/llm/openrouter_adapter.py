@@ -31,7 +31,7 @@ class OpenRouterAdapter(LLMAdapter):
         self,
         api_key: Optional[str] = None,
         model_name: str = OPENROUTER_MODEL,
-        max_output_tokens: int = 4096,
+        max_output_tokens: int = 8192,
         **kwargs
     ):
         super().__init__(model_name=model_name, **kwargs)
@@ -136,7 +136,16 @@ class OpenRouterAdapter(LLMAdapter):
         """Generate multiple MCQ questions in a single API call"""
         
         prompt = self._build_batch_mcq_prompt(passage, num_questions, options)
-        response_text = await self._call_with_retry(prompt)
+        
+        # Dynamic max_tokens calculation based on number of questions
+        # Each question needs ~400-600 tokens (question + 4 choices + explanation)
+        tokens_per_question = 600
+        estimated_tokens = num_questions * tokens_per_question + 500  # Buffer for JSON structure
+        dynamic_max_tokens = max(self.max_output_tokens, min(estimated_tokens, 16384))
+        
+        logger.debug(f"Generating {num_questions} questions with max_tokens={dynamic_max_tokens}")
+        
+        response_text = await self._call_with_retry(prompt, max_tokens=dynamic_max_tokens)
 
         try:
             data = self._extract_json(response_text)
